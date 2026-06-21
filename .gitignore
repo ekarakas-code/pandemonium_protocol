@@ -1,0 +1,27 @@
+# --- Python build / cache artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test / type-check caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Pandemonium index data store (large, machine-specific; rebuilt by the tool) ---
+# Matches the live store and any nested fixture/stray indexes at every level.
+.pandemonium/
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db

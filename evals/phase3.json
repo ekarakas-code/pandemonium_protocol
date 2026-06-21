@@ -1,0 +1,13 @@
+{
+  "queries": 15,
+  "precision_at_1": 0.467,
+  "precision_at_3": 0.733,
+  "precision_at_5": 0.8,
+  "symbol_precision_at_5": 0.667,
+  "mrr": 0.602,
+  "avg_pack_tokens": 1874.9,
+  "avg_cards_tokens": 193.7,
+  "token_savings_cards_vs_pack": 0.897,
+  "same_path_repeat_rate": 0.28,
+  "fetches_to_resolution": null
+}

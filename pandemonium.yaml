@@ -1,0 +1,65 @@
+# PandemoniumProtocol configuration. All values here override the built-in
+# defaults (pandemonium/config/settings.py). Paths are resolved relative to this
+# file's directory unless absolute.
+
+project:
+  name: pandemonium-protocol
+
+storage:
+  sqlite_path: .pandemonium/pandemonium.db
+  lancedb_path: .pandemonium/lancedb
+  audit_log: .pandemonium/audit.log
+
+embedding:
+  provider: sentence-transformers
+  model: BAAI/bge-small-en-v1.5
+  device: cpu
+  normalize: true
+  batch_size: 32
+  dim: 384
+  query_prefix: "Represent this sentence for searching relevant passages: "
+
+indexing:
+  chunk_min_lines: 5
+  chunk_max_tokens: 512
+  include_tests: true
+  incremental: true
+  max_file_bytes: 1000000
+  scopes: [symbol] # Phase-4 bake-off winner (symbol-primary; file/code-on-parsed dropped)
+  languages: [python] # MVP: Python first. More languages land in later phases.
+
+retrieval:
+  mode: hybrid
+  vector_top_k: 20
+  keyword_top_k: 20
+  symbol_top_k: 10
+  final_top_k: 10
+  weights: # MVP weights (note/relationship channels are empty in the MVP)
+    symbol: 0.40
+    keyword: 0.30
+    vector: 0.30
+
+context_pack:
+  default_token_budget: 4000
+  tokenizer: cl100k_base
+  include_summaries: true
+  include_line_ranges: true
+  include_tests: true
+  include_risks: true
+  max_chunk_chars: 1600
+
+summaries:
+  # heuristic = fully local, no LLM (default).
+  # external_llm = opt-in; requires `pip install pandemonium[llm]` AND enabled: true.
+  #   When enabled, code excerpts are sent to an external API (logged to the audit log).
+  provider: heuristic
+  enabled: false
+  external:
+    model: claude-haiku-4-5
+    max_tokens: 256
+
+enrichment:
+  # heuristic (default) | cache (precomputed ref->{summary,tags}) | claude_cli
+  provider: cache
+  cache_path: .pandemonium/enrichment.json
+  model: claude-haiku-4-5

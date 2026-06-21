@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pandemonium"
+version = "0.1.0"
+description = "PandemoniumProtocol (ProjectRAG) — local-first codebase intelligence and token-budgeted context packs for LLM coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "PandemoniumProtocol" }]
+dependencies = [
+    "lancedb>=0.20",
+    "sentence-transformers>=3.0",
+    "tree-sitter>=0.25",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-cpp>=0.23",
+    "tree-sitter-c-sharp>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tiktoken>=0.7",
+    "typer>=0.12",
+    "rich>=13.0",
+    "mcp>=1.2",
+    "pyyaml>=6.0",
+    "numpy>=1.24",
+    "pyarrow>=16.0",
+]
+
+[project.optional-dependencies]
+# Opt-in external-LLM summarizer. Absent from the default install closure on purpose:
+# `pip install pandemonium[llm]` to enable, otherwise zero cloud SDKs are pulled.
+llm = ["anthropic>=0.40"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+pandemonium = "pandemonium.cli.main:app"
+
+[tool.setuptools.packages.find]
+include = ["pandemonium*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

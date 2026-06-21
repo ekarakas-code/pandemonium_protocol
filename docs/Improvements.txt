@@ -1,0 +1,1071 @@
+## Summary
+
+Your **PandemoniumProtocol** direction is strong. The central move — **embed clean semantic descriptors, store raw code separately, and let the LLM fetch exact code by reference only when needed** — is the right architectural bet. It improves retrieval quality, reduces token waste, and gives agents a more controllable workflow than dumping large code chunks blindly. 
+
+The design is especially good because it separates three concerns that are often mixed together:
+
+1. **Search representation** — what gets embedded.
+2. **Storage representation** — what exact code is preserved.
+3. **Agent interaction model** — how the LLM sees summaries first, then fetches details.
+
+That separation is the foundation of a much better retrieval system.
+
+---
+
+## Main Architectural Judgment
+
+I agree with the core principle:
+
+> **Do not embed raw code as the primary semantic object. Embed a structured descriptor/card; store code for exact retrieval.**
+
+Raw code is useful for exact matching, but it is often noisy for general embedding models. A descriptor containing summary, signature, qualified name, identifiers, domain tags, and responsibilities is a much better semantic target. The vector search should answer: “Which unit is conceptually relevant?” Then `repo_get` should answer: “Show me the exact code.”
+
+That is a cleaner architecture than trying to make one embedding serve both semantic search and exact source delivery.
+
+---
+
+## What I Strongly Agree With
+
+### 1. The “card” model is the right abstraction
+
+The proposed card structure is excellent:
+
+```text
+ref
+scope
+language
+path
+qualified_name
+parent
+signature
+summary
+tags
+code stored separately
+```
+
+This gives the LLM enough context to decide whether something is worth fetching, without wasting tokens on code that may not be relevant.
+
+The most important fields are:
+
+| Field            | Importance                              |
+| ---------------- | --------------------------------------- |
+| `ref`            | Lets the LLM request exact source later |
+| `scope`          | Prevents file/symbol/chunk ambiguity    |
+| `qualified_name` | Gives semantic and structural identity  |
+| `summary`        | Improves embedding quality              |
+| `tags`           | Helps filtering and agent reasoning     |
+| `code`           | Stored, not embedded, fetched on demand |
+
+This is very close to how a production-grade code intelligence system should behave.
+
+---
+
+### 2. Stable references are essential
+
+Your warning about `path:start-end` going stale is exactly right. Line numbers are useful as a display/detail, but they are not stable anchors.
+
+The best priority order is:
+
+1. **Stable internal id**, if available.
+2. **`path::qualified_name`**, resolved dynamically.
+3. **`path:line-range`**, only as fallback.
+
+The acceptance test you described is also correct: edit a file, shift the lines, and confirm the same ref still resolves to the right symbol.
+
+This is not a minor implementation detail. It is one of the differences between a toy RAG system and a reliable agentic codebase navigator.
+
+---
+
+### 3. Claude/LLM enrichment is probably the biggest quality gain
+
+Heuristic summaries are good enough for a baseline, but LLM-generated summaries and tags are likely to improve semantic recall significantly.
+
+The best structure is:
+
+```text
+heuristic provider = default, local, zero-cost
+claude provider = opt-in high-quality enrichment
+local_llm provider = local privacy-preserving middle ground
+```
+
+This gives users a sane privacy/cost choice.
+
+Your proposed tag categories are also good:
+
+```text
+responsibilities
+depends_on
+domain
+search_terms
+```
+
+I would keep this schema fixed at first. Free-form tags sound flexible, but they quickly become inconsistent and harder to filter.
+
+---
+
+### 4. Measuring before expanding scope is the correct discipline
+
+The eval-first approach is very important. Without an evaluation harness, every retrieval improvement becomes guesswork.
+
+The two metrics you listed are the right ones:
+
+| Metric                 | Why it matters                                              |
+| ---------------------- | ----------------------------------------------------------- |
+| `precision@k` / `MRR`  | Measures whether the right symbol/file appears near the top |
+| `tokens-to-right-code` | Measures whether the new agent loop actually saves context  |
+
+I would add one more metric:
+
+| Metric                        | Why                                                                              |
+| ----------------------------- | -------------------------------------------------------------------------------- |
+| **fetch count to resolution** | Measures how many `repo_get` calls the agent needs before finding the right code |
+
+A retrieval system that gives cheap cards but forces five follow-up fetches may not actually be better than a larger initial pack. The goal is not only fewer tokens; it is fewer tokens **and** fewer reasoning steps.
+
+---
+
+## Main Suggestions / Adjustments
+
+### Suggestion 1: Make `symbol` scope the primary unit
+
+I would treat **symbol-scope cards** as the core retrieval object.
+
+File scope is useful for orientation. Code chunks are useful as fallback. But the symbol is usually the right unit for agent work because it has a natural identity: function, class, method, interface, component, module-level constant, etc.
+
+Recommended priority:
+
+1. **Symbol scope** — primary retrieval target.
+2. **File scope** — overview / “where is this handled?”
+3. **Code chunk scope** — fallback for languages or files where symbol extraction fails.
+
+Do not remove code chunks immediately, but do not let them dominate the system. The eval harness should decide whether code-scope still earns its cost.
+
+---
+
+### Suggestion 2: Keep raw code out of embeddings by default
+
+I would not embed raw code into the main semantic vector.
+
+Better descriptor format:
+
+```text
+Language: Python
+Scope: symbol
+Qualified name: Retriever.search
+Signature: search(query: str, filters: SearchFilters) -> list[SearchResult]
+Summary: Performs hybrid search across vector and keyword indexes, applies filters, and returns ranked result cards.
+Responsibilities: retrieval, ranking, filtering
+Depends on: VectorStore, KeywordIndex, SearchFilters
+Domain: repository search, context packing, code navigation
+Search terms: find relevant code, retrieve symbols, semantic search, repo context
+```
+
+This is much better embedding input than raw source code.
+
+However, there is one caveat: for some code-specific models, raw code may help. So I would not philosophically ban raw code forever. I would treat it as a separate experiment:
+
+| Variant                         | Description                 |
+| ------------------------------- | --------------------------- |
+| Descriptor-only                 | Main recommended baseline   |
+| Descriptor + identifiers        | Likely best default         |
+| Descriptor + small code excerpt | Worth testing               |
+| Raw code full chunk             | Current/baseline comparison |
+
+But the default should be descriptor-first.
+
+---
+
+### Suggestion 3: `repo_get` should support expansion from the beginning
+
+I would not make `repo_get` return only the exact span. It should support controlled expansion immediately, because agents often need local context.
+
+Recommended expansion modes:
+
+| Mode        | Purpose                                   |
+| ----------- | ----------------------------------------- |
+| `exact`     | Only the target symbol                    |
+| `neighbors` | Target symbol plus nearby symbols/imports |
+| `file`      | Whole file                                |
+| `parent`    | Containing class/module                   |
+| `callers`   | Later-stage feature                       |
+| `callees`   | Later-stage feature                       |
+
+For Stage 1, I would include:
+
+```text
+exact
+neighbors
+file
+```
+
+Then add `callers` and `callees` later once symbol graph/indexing is stronger.
+
+The most useful default is probably:
+
+```text
+repo_get(ref, expand="exact")
+```
+
+But the agent should be able to ask for:
+
+```text
+repo_get(ref, expand="neighbors")
+```
+
+when the symbol alone is insufficient.
+
+---
+
+### Suggestion 4: Keep Claude enrichment opt-in, not default
+
+I would not make Claude on-by-default.
+
+Reason: sending code to an external API is a serious privacy/security boundary. Even if many users accept it, the system should not silently do that.
+
+Recommended policy:
+
+```text
+Default: heuristic
+Optional: claude
+Optional: local_llm
+```
+
+With explicit config like:
+
+```text
+enrichment_provider = "heuristic" | "claude" | "local_llm"
+```
+
+Claude can be strongly recommended, but it should require deliberate enablement.
+
+For model choice, I agree with your instinct: **Haiku-class model for bulk enrichment**, unless the repo is very complex or the summaries need deeper architectural reasoning. Sonnet/Opus are probably overkill for most indexing unless used selectively.
+
+Best pattern:
+
+| Task                                        | Model tier              |
+| ------------------------------------------- | ----------------------- |
+| Bulk symbol summaries                       | Cheap/fast model        |
+| Complex architectural file summaries        | Stronger model optional |
+| Debugging / reasoning about system behavior | Stronger model          |
+
+---
+
+### Suggestion 5: Fixed tag schema first, flexible tags later
+
+Use a fixed tag schema initially:
+
+```text
+responsibilities
+depends_on
+domain
+search_terms
+```
+
+I would add two more optional fields:
+
+```text
+side_effects
+entrypoints
+```
+
+Why?
+
+`side_effects` helps answer questions like:
+
+> “Where does this write to disk?”
+> “Where does this mutate state?”
+> “Where does this call the network?”
+
+`entrypoints` helps identify CLI commands, API routes, handlers, workers, scheduled jobs, plugin hooks, etc.
+
+So my suggested schema would be:
+
+```text
+{
+  "responsibilities": [],
+  "depends_on": [],
+  "domain": [],
+  "search_terms": [],
+  "side_effects": [],
+  "entrypoints": []
+}
+```
+
+Keep them structured. Avoid free-form LLM-only tags until the core system is stable.
+
+---
+
+## Risks / Weak Points
+
+### 1. LLM summaries can hallucinate
+
+The summaries and tags must be grounded in the actual code. The enricher should be instructed to avoid inventing behavior. But more importantly, the system should treat summaries as **retrieval hints**, not as truth.
+
+The exact code remains the source of truth.
+
+Good principle:
+
+> Summaries guide retrieval; `repo_get` confirms reality.
+
+---
+
+### 2. Symbol extraction quality becomes critical
+
+Once symbol-scope becomes central, extraction quality matters a lot. Bad symbol boundaries will produce bad refs, bad summaries, and bad code fetches.
+
+You will need strong tests around:
+
+* nested classes/functions
+* overloaded methods
+* decorators/annotations
+* anonymous functions
+* partial classes
+* language-specific symbol naming
+* duplicate qualified names
+* generated files
+* large files with mixed responsibilities
+
+This is especially important once you add C++, C#, JS, and markdown.
+
+---
+
+### 3. Tags can become inconsistent across providers
+
+Heuristic tags, Claude tags, and local LLM tags may produce different vocabularies. That can hurt filtering.
+
+Example:
+
+```text
+auth
+authentication
+login
+identity
+access-control
+```
+
+These may all describe similar concepts but fragment search quality.
+
+You may eventually want a normalization layer:
+
+```text
+raw_tags -> normalized_tags
+```
+
+But this can wait until after baseline measurement.
+
+---
+
+### 4. Multi-scope indexing can cause duplicate hits
+
+If file, symbol, and code chunks all contain similar descriptors, search results may return near-duplicates:
+
+```text
+file: retriever.py
+symbol: Retriever.search
+code: chunk containing Retriever.search
+```
+
+This is not automatically bad, but the result pack should deduplicate or group results.
+
+Suggested display model:
+
+```text
+File: retriever.py
+  Symbol: Retriever.search
+  Symbol: Retriever.rank
+  Chunk: lines 90-140
+```
+
+Instead of showing three unrelated cards.
+
+---
+
+## Recommended Decisions
+
+Here is how I would answer the five decision points in your document.
+
+| Decision             | Recommendation                                                   |
+| -------------------- | ---------------------------------------------------------------- |
+| Descriptor strategy  | Yes: embed descriptor, store raw code                            |
+| Claude default       | Opt-in, not default                                              |
+| Claude model         | Cheap model for bulk enrichment; stronger model only selectively |
+| Scopes               | Let eval decide, but start symbol-first                          |
+| `repo_get` expansion | Support `exact`, `neighbors`, and `file` early                   |
+| Tag schema           | Fixed structured schema first; add normalization later           |
+
+---
+
+## Revised Phase Plan
+
+Your phase plan is already good. I would slightly adjust it like this:
+
+### Phase 0 — Evaluation Baseline
+
+Goal: know current retrieval quality before changing architecture.
+
+Measure:
+
+* precision@k
+* MRR
+* tokens-to-right-code
+* fetches-to-right-code
+* duplicate result rate
+
+This gives you a baseline against which every later change must justify itself.
+
+---
+
+### Phase 1 — Card Model + Stable Refs + `repo_get`
+
+This should be the real foundation.
+
+Deliverables:
+
+* card schema
+* stable refs
+* ref resolver
+* `repo_search` returns cards, not raw code
+* `repo_get` fetches exact source
+* basic expansion modes: `exact`, `neighbors`, `file`
+
+This phase gives you the agentic retrieval loop even before Claude enrichment.
+
+---
+
+### Phase 2 — Descriptor-Based Embedding
+
+Change the vectorized input from raw code-heavy chunks to clean semantic descriptors.
+
+Start with heuristic descriptors.
+
+This isolates the effect of descriptor-based embedding before introducing LLM-generated summaries.
+
+---
+
+### Phase 3 — Claude / LLM Enrichment
+
+Add opt-in enrichment:
+
+* summaries
+* structured tags
+* cache by content hash
+* audit logging
+* batch mode
+* provider abstraction
+
+Then compare:
+
+```text
+heuristic descriptor vs Claude descriptor
+```
+
+This tells you whether the cost/privacy tradeoff is worth it.
+
+---
+
+### Phase 4 — Scope Bake-Off
+
+Compare:
+
+```text
+symbol-only
+file + symbol
+symbol + code
+file + symbol + code
+```
+
+Do not assume multi-scope is better. It may improve recall but hurt precision and increase duplicate noise.
+
+---
+
+### Phase 5 — Embedding Model Bake-Off
+
+Compare:
+
+* current bge-small
+* bge-base
+* code-specialized embedding model
+* maybe hybrid vector + keyword ranking
+
+Important: do this after the descriptor format is stable, otherwise you are comparing models on a moving target.
+
+---
+
+### Phase 6 — Multi-language Expansion
+
+Then add:
+
+* C++
+* C#
+* JavaScript/TypeScript
+* Markdown headings/docs
+* possibly config files: YAML, JSON, TOML
+
+This should come after the retrieval architecture is proven in one language.
+
+---
+
+## Final Judgment
+
+The design is conceptually sound. The strongest part is the shift from **“retrieval dumps code into context”** to **“retrieval gives the agent references, summaries, and controlled fetch ability.”**
+
+That is the correct direction for agentic codebase navigation.
+
+My biggest recommendations are:
+
+1. Make **symbol-scope cards** the core abstraction.
+2. Keep **raw code out of embeddings by default**.
+3. Make Claude enrichment **opt-in but first-class**.
+4. Add `repo_get` expansion modes early.
+5. Use a **fixed structured tag schema**.
+6. Measure duplicate results and fetch-count, not only retrieval ranking.
+7. Treat summaries as retrieval aids, never as source-of-truth.
+
+Overall: proceed with this architecture. It is clean, measurable, scalable, and much more agent-friendly than classic “stuff chunks into context” RAG.
+
+
+## Summary
+
+Then your system should be designed less like a “RAG search engine” and more like a **Claude operating skill for codebase navigation**.
+
+The goal is:
+
+> **Claude should not read the whole repo. Claude should ask for cheap, high-signal references, choose what matters, fetch exact code only when necessary, and coordinate subagents through compact evidence packets.**
+
+That fits your PandemoniumProtocol idea very well: search returns **cards**, not code; code is fetched only through stable refs; session state stores what was already discovered; parallel agents return summaries with evidence. Your uploaded design already points in this direction by separating embedded descriptors from stored code and making `repo_get(ref)` the exact-code retrieval step. 
+
+---
+
+# 1. The Claude Skill should be a controller, not the database
+
+The most important design decision:
+
+> **Do not make the Claude Skill itself contain the project knowledge. Make the Skill teach Claude how to use PandemoniumProtocol.**
+
+A Claude Skill should be thin. It should define:
+
+* when to activate,
+* how Claude should search,
+* how Claude should fetch code,
+* how much context Claude is allowed to request,
+* how to delegate to subagents,
+* how to merge subagent findings,
+* how to avoid repeatedly reading the same files.
+
+Claude Skills are built around a `SKILL.md` file, and Claude Code can invoke them automatically or directly by `/skill-name`. Anthropic’s docs also warn that once a skill loads, its content stays in context, so large skill files become recurring token cost; detailed material should be moved into supporting files. ([Claude Code][1])
+
+So the skill should not be huge. It should act like a **retrieval discipline manual**.
+
+Good mental model:
+
+```text
+Claude Skill = protocol + rules + tool usage policy
+Pandemonium backend = index + SQLite + LanceDB + source resolver + session memory
+Claude/subagents = reasoning layer
+```
+
+---
+
+# 2. Recommended Skill Shape
+
+I would design it as a skill called something like:
+
+```text
+pandemonium
+repo-navigator
+codebase-memory
+agentic-retrieval
+```
+
+The skill’s purpose:
+
+> Use PandemoniumProtocol whenever Claude needs to understand, modify, debug, refactor, review, or extend a codebase without loading unnecessary files into context.
+
+Its activation description should be very explicit because the `description` field is the primary mechanism Claude uses to decide whether to invoke a skill. Anthropic’s skill-creator guidance specifically emphasizes optimizing the description for triggering accuracy. ([GitHub][2])
+
+The skill should activate on prompts like:
+
+* “implement this feature”
+* “fix this bug”
+* “find where this behavior happens”
+* “refactor this system”
+* “understand this codebase”
+* “update the related files”
+* “make sure all affected places are changed”
+* “use parallel agents to inspect this”
+
+It should **not** activate for tiny one-file edits where normal reading is enough.
+
+---
+
+# 3. Core Workflow Claude Should Follow
+
+The Claude Skill should enforce this loop:
+
+## Step 1 — Understand the task
+
+Claude first classifies the task:
+
+| Task Type            | Retrieval Need                                              |
+| -------------------- | ----------------------------------------------------------- |
+| Simple edit          | maybe one search                                            |
+| Bug fix              | search symptoms, entrypoints, error terms                   |
+| Feature addition     | search domain concepts, interfaces, similar implementations |
+| Refactor             | search all dependent symbols                                |
+| Cross-cutting update | use parallel agents                                         |
+| Unknown architecture | start with file-scope cards                                 |
+
+This classification matters because not every task deserves parallel agents or broad search.
+
+---
+
+## Step 2 — Search cards first, never raw code first
+
+The first retrieval should return compact cards:
+
+```text
+ref
+scope
+path
+qualified_name
+summary
+tags
+line range
+confidence/rank
+```
+
+No raw code yet.
+
+This is exactly aligned with your design: search gives cheap tagged references, then the LLM decides what to fetch. 
+
+Claude should see something like:
+
+```text
+1. ref: src/auth/AuthService::validateToken
+   summary: validates JWT, loads user claims, handles expiration
+   tags: auth, jwt, user-session
+   scope: symbol
+
+2. ref: src/middleware/authMiddleware::requireAuth
+   summary: Express middleware that rejects unauthenticated requests
+   tags: auth, http, middleware
+   scope: symbol
+```
+
+Then Claude chooses what to fetch.
+
+---
+
+## Step 3 — Fetch exact code only for selected refs
+
+The Skill should tell Claude:
+
+> Fetch code only when a card is plausibly relevant to the change.
+
+This is where `repo_get(ref)` matters.
+
+Recommended fetch modes:
+
+| Mode        | Use                                |
+| ----------- | ---------------------------------- |
+| `exact`     | fetch one symbol                   |
+| `neighbors` | symbol plus nearby context/imports |
+| `parent`    | containing class/module            |
+| `file`      | whole file only when necessary     |
+| `callers`   | impact analysis                    |
+| `callees`   | dependency understanding           |
+
+The default should be:
+
+```text
+exact first, neighbors second, file last
+```
+
+This rule alone saves a lot of tokens.
+
+---
+
+## Step 4 — Build a compact “working context”
+
+After search and fetch, Claude should create a temporary working context:
+
+```text
+Task:
+Need to add X.
+
+Relevant refs:
+- A: why it matters
+- B: why it matters
+- C: why it matters
+
+Fetched code:
+- A exact
+- B exact
+- C neighbors
+
+Likely edit targets:
+- file 1
+- file 2
+
+Open questions:
+- whether API route needs update
+- whether tests exist
+```
+
+This context is much smaller than dumping all files.
+
+---
+
+## Step 5 — Make changes
+
+Only after this should Claude edit.
+
+The Skill should explicitly discourage the common bad behavior:
+
+> Do not start editing from a vague search result. First identify the source-of-truth symbol, nearby dependencies, and tests.
+
+---
+
+## Step 6 — Verify impact
+
+After edits, Claude should search again:
+
+* affected callers,
+* tests,
+* configuration,
+* docs,
+* interfaces,
+* duplicate implementations.
+
+The Skill should make this mandatory for medium/large tasks.
+
+---
+
+# 4. Parallel Agent Design
+
+For parallel agents, the main risk is that each agent wastes tokens rediscovering the same thing. So you need a strict protocol.
+
+The main Claude agent should not say:
+
+> “Agents, go inspect the repo.”
+
+That is too vague.
+
+Instead, it should create **task capsules**.
+
+## Task Capsule
+
+Each subagent receives:
+
+```text
+Objective:
+Find all places related to X.
+
+Allowed retrieval:
+Use repo_search first.
+Fetch max 3 exact refs unless more is justified.
+Do not read whole files unless necessary.
+
+Return:
+- relevant refs
+- why each matters
+- code fetched
+- confidence
+- recommended edit targets
+- risks
+```
+
+This makes subagents efficient.
+
+Claude Code supports running skills in isolated subagents with `context: fork`, where the skill content becomes the subagent prompt and the subagent returns summarized results to the main conversation. That is very close to what you want for parallel code research. ([Claude Code][1])
+
+---
+
+# 5. Recommended Parallel Agent Roles
+
+For coding tasks, I would use specialized agents like this:
+
+| Agent                    | Purpose                                                     |
+| ------------------------ | ----------------------------------------------------------- |
+| **Architecture agent**   | Finds core design and ownership boundaries                  |
+| **Implementation agent** | Finds concrete edit targets                                 |
+| **Dependency agent**     | Finds callers/callees/side effects                          |
+| **Test agent**           | Finds relevant tests and missing coverage                   |
+| **Risk agent**           | Finds breaking changes, hidden assumptions, security issues |
+| **Docs/API agent**       | Finds public interfaces, README/docs/config if relevant     |
+
+But do not always launch all of them.
+
+Use this rule:
+
+| Task Size             | Agent Use                                   |
+| --------------------- | ------------------------------------------- |
+| Small one-file fix    | no parallel agents                          |
+| Medium feature/bug    | 2–3 agents                                  |
+| Large refactor        | 4–6 agents                                  |
+| Unknown legacy system | architecture + implementation + tests first |
+
+The Skill should tell Claude to use parallel agents only when the task has enough breadth to justify them.
+
+---
+
+# 6. Session Memory Design
+
+This is crucial for your stated purpose: improving effectiveness **throughout sessions**.
+
+The system should remember what was already discovered during the current session:
+
+```text
+session_id
+task_id
+searched_queries
+returned_refs
+fetched_refs
+edited_files
+confirmed_facts
+open_questions
+agent_findings
+invalidated_assumptions
+```
+
+Claude Skills support substitutions such as `${CLAUDE_SESSION_ID}`, which is useful for session-specific logging or correlation. ([Claude Code][1])
+
+So Pandemonium should maintain a session ledger:
+
+```text
+Session Ledger:
+- Already searched: "auth token validation", "jwt middleware"
+- Already fetched: AuthService::validateToken
+- Confirmed: token expiration handled in AuthService, not middleware
+- Edited: AuthService.ts, auth.test.ts
+- Still unknown: refresh-token path
+```
+
+Then the skill can instruct Claude:
+
+> Before searching broadly, check the session ledger. Do not fetch a ref again unless the file changed or the previous context was insufficient.
+
+This directly improves long-session effectiveness.
+
+---
+
+# 7. The Most Important Token-Saving Rule
+
+The Skill should make Claude follow a retrieval budget.
+
+Example policy:
+
+| Stage              | Budget                                         |
+| ------------------ | ---------------------------------------------- |
+| Initial search     | 10–20 cards                                    |
+| Initial fetch      | 1–3 refs                                       |
+| Before edit        | max 5 fetched refs unless justified            |
+| Whole-file fetch   | only with reason                               |
+| Parallel agent     | each agent max 3–5 refs                        |
+| Final verification | search cards first, fetch only suspicious refs |
+
+The goal is not “minimal tokens at all costs.” The goal is:
+
+> **Enough code to be correct, not so much code that the model loses focus.**
+
+That distinction matters.
+
+---
+
+# 8. What the Skill Should Tell Claude Not To Do
+
+This part is very important.
+
+The Skill should explicitly prohibit these behaviors:
+
+1. **Do not dump raw search results into context.**
+2. **Do not fetch whole files as the default.**
+3. **Do not let multiple agents inspect the same area unless assigned different purposes.**
+4. **Do not edit before identifying ownership boundaries.**
+5. **Do not trust summaries as truth; exact code is truth.**
+6. **Do not repeat searches already recorded in the session ledger.**
+7. **Do not use line numbers as stable identity.**
+8. **Do not assume a symbol is current if the file changed after indexing.**
+
+This makes the skill much more reliable.
+
+---
+
+# 9. How I Would Split the Skill Package
+
+I would not put everything into one giant `SKILL.md`.
+
+Claude’s docs recommend keeping `SKILL.md` concise and moving detailed references into supporting files. ([Claude Code][1])
+
+Recommended skill package:
+
+```text
+pandemonium/
+  SKILL.md
+  retrieval-protocol.md
+  parallel-agent-protocol.md
+  session-ledger-protocol.md
+  ref-rules.md
+  eval-rubric.md
+```
+
+Conceptually:
+
+| File                         | Purpose                                        |
+| ---------------------------- | ---------------------------------------------- |
+| `SKILL.md`                   | Short activation rules and main workflow       |
+| `retrieval-protocol.md`      | Search/get/context-pack rules                  |
+| `parallel-agent-protocol.md` | How to delegate and merge findings             |
+| `session-ledger-protocol.md` | How to preserve discoveries across the session |
+| `ref-rules.md`               | Stable refs, fallback refs, invalidation       |
+| `eval-rubric.md`             | How to judge whether retrieval helped          |
+
+The `SKILL.md` should be short enough that it is cheap to keep in context.
+
+---
+
+# 10. Skill Invocation Strategy
+
+I would make this skill both manually and automatically invocable.
+
+Manual:
+
+```text
+/pandemonium fix the login bug
+/pandemonium implement caching for search results
+/pandemonium inspect impact of changing UserService
+```
+
+Automatic:
+
+Claude should invoke it when the task clearly involves codebase navigation, multi-file updates, bug tracing, or architectural investigation.
+
+However, for destructive workflows like auto-committing, deploying, or modifying many files, you would want separate manual-only skills. Claude Code supports `disable-model-invocation: true` for workflows that should not be triggered automatically. ([Claude Code][1])
+
+So:
+
+| Skill                      | Invocation                |
+| -------------------------- | ------------------------- |
+| `pandemonium`              | auto + manual             |
+| `pandemonium-research`     | auto or subagent          |
+| `pandemonium-refactor`     | probably manual           |
+| `pandemonium-commit`       | manual only               |
+| `pandemonium-batch-agents` | manual or carefully gated |
+
+---
+
+# 11. Main Tools Pandemonium Should Expose
+
+Even if implementation comes later, conceptually the Skill should teach Claude these verbs:
+
+| Tool/Command        | Purpose                                           |
+| ------------------- | ------------------------------------------------- |
+| `repo_search`       | return compact cards                              |
+| `repo_get`          | fetch exact code by stable ref                    |
+| `repo_context_pack` | produce bounded context bundle                    |
+| `repo_graph`        | callers/callees/dependencies                      |
+| `repo_impact`       | what may break if this changes                    |
+| `repo_session`      | read/write session ledger                         |
+| `repo_changed`      | check whether fetched refs are stale              |
+| `repo_tests`        | find tests related to refs                        |
+| `repo_explain`      | explain a symbol/file from cards and fetched code |
+
+Do not expose too many verbs at first. Too many tools confuse agents.
+
+Minimal first version:
+
+```text
+repo_search
+repo_get
+repo_context_pack
+repo_session
+```
+
+Then add graph and impact analysis.
+
+---
+
+# 12. Best Version of the System
+
+The best version is this:
+
+## Claude starts with intent
+
+> “I need to implement X.”
+
+## Pandemonium gives map
+
+> “These 12 symbols/files are probably relevant.”
+
+## Claude selects evidence
+
+> “Fetch these 3 refs.”
+
+## Claude delegates focused research
+
+> “Agent A: find callers. Agent B: find tests. Agent C: inspect similar implementation.”
+
+## Agents return compact evidence
+
+> “Here are refs, risks, and suggested edit targets.”
+
+## Main Claude edits
+
+> “Now I know exactly where to modify.”
+
+## Pandemonium validates
+
+> “These callers/tests/docs may also be affected.”
+
+## Claude finalizes
+
+> “Change is correct, tested, and context-efficient.”
+
+That is a very good architecture.
+
+---
+
+# 13. My Strongest Recommendation
+
+Design the Claude Skill around this principle:
+
+> **PandemoniumProtocol is not a search feature. It is an attention-management system for coding agents.**
+
+The real value is not just better embeddings. The real value is controlling what the model pays attention to.
+
+So your design priorities should be:
+
+1. **Stable references**
+2. **Cheap cards**
+3. **Exact fetch**
+4. **Session ledger**
+5. **Parallel agent task capsules**
+6. **Evidence-based merge**
+7. **Token budget discipline**
+8. **Verification after edits**
+
+If you get those right, the embedding model is secondary. Better embeddings help, but the bigger win is the operating protocol.
+
+---
+
+## Final Design Verdict
+
+Yes: make it a Claude Skill.
+
+But make it a **thin Claude Skill over a strong local retrieval/indexing backend**, not a giant prompt.
+
+The Skill should teach Claude:
+
+* when to use Pandemonium,
+* how to search,
+* when to fetch exact code,
+* how to avoid token waste,
+* how to coordinate parallel agents,
+* how to preserve session discoveries,
+* how to verify before and after edits.
+
+That gives you exactly what you want: stronger LLM performance across long sessions, less repeated code reading, better multi-agent coordination, and fewer incorrect updates caused by missing relevant code.
+
+[1]: https://code.claude.com/docs/en/skills "Extend Claude with skills - Claude Code Docs"
+[2]: https://github.com/anthropics/skills/blob/main/skills/skill-creator/SKILL.md "skills/skills/skill-creator/SKILL.md at main · anthropics/skills · GitHub"
+

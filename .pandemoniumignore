@@ -1,0 +1,63 @@
+# PandemoniumProtocol ignore rules (gitignore-style).
+# Self-exclusion + secrets + build artifacts + binaries. Edited freely; secrets
+# and the .pandemonium/ data dir should always stay excluded.
+
+# --- self-exclusion (the index must never index its own store) ---
+.pandemonium/
+.git/
+.venv/
+venv/
+env/
+
+# --- eval/test fixture corpora (indexed separately by their own eval modes) ---
+evals/fixtures/
+
+# --- generated / build / vendor ---
+node_modules/
+bin/
+obj/
+dist/
+build/
+target/
+out/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- IDE ---
+.vs/
+.idea/
+.vscode/
+
+# --- secrets (NEVER index) ---
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.cer
+*.p12
+secrets/
+credentials/
+
+# --- binaries / archives / compiled ---
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.dll
+*.exe
+*.so
+*.dylib
+*.pyc
+*.pyd
+*.bin
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.pdf

@@ -1,0 +1,4 @@
+# Keep the header OUT of the index so the only indexed carrier of the target's doc words is
+# the .cpp definition — isolating what the Step-8 merge does. The indexer still reads the
+# header off disk for the merge (src/ <-> include/ sibling lookup), it just isn't chunked.
+include/

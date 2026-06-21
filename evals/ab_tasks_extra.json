@@ -1,0 +1,90 @@
+[
+  {
+    "id": "head_view_off_by_one",
+    "prompt": "When fetching only the first N lines of a code span (the \"head\" view used to preview a symbol's opening lines), the result includes one extra line. For example, requesting the first 3 lines of a function returns 4 lines, and the reported end line is one greater than expected. Full-span and line-range views are unaffected; only the \"first N lines\" preview is off by one. Please make the head preview return exactly N lines.",
+    "mutations": [
+      [
+        "pandemonium/refs.py",
+        "        return start, min(end, start + n - 1)",
+        "        return start, min(end, start + n)"
+      ]
+    ]
+  },
+  {
+    "id": "ambiguous_callee_boundary_off_by_one",
+    "prompt": "In the related-code view for a symbol, calls to a method whose name is shared by a very large number of definitions across the repo are sometimes still listed individually as ambiguous calls instead of being rolled up into a single summary line. Specifically, when a name's collision count lands exactly at the cutoff for \"too common to resolve by name,\" it slips through and is shown one-by-one rather than collapsed, and no summary line appears at all. Names shared by only a couple of definitions continue to display correctly â€” only the most common names regress.",
+    "mutations": [
+      [
+        "pandemonium/graph.py",
+        "        (suppressed if c.get(\"collisions\", 0) >= threshold else kept).append(c)",
+        "        (suppressed if c.get(\"collisions\", 0) > threshold else kept).append(c)"
+      ]
+    ]
+  },
+  {
+    "id": "tie_break_reversed",
+    "prompt": "When two search results end up with the same combined relevance score, they are coming back in the wrong order. Results are still correctly sorted by score (highest first), and the ordering is stable/reproducible across runs, but for items that are tied on score the ordering of their identifiers is backwards: a chunk like \"c_b\" is ranked ahead of \"c_a\" when the tie should resolve by chunk id in ascending order. Equal-scoring candidates should be broken by chunk id ascending (so \"c_a\" comes before \"c_b\"), but they are being ordered descending instead.",
+    "mutations": [
+      [
+        "pandemonium/retrieval/hybrid_search.py",
+        "    merged.sort(key=lambda x: (-x[1], x[0]))",
+        "    merged.sort(key=lambda x: (x[1], x[0]), reverse=True)"
+      ]
+    ]
+  },
+  {
+    "id": "empty_code_fence_slice",
+    "prompt": "When I ask the assistant for a context pack for a short, single-identifier task (e.g. just the name of one function), the pack correctly lists the relevant source file and its symbols, but the code snippet for that file comes back as an empty fenced block â€” no actual source lines appear inside the code fence. The expected function body is missing from the output even though the file clearly matched. Larger excerpts seem fine; it's the small files/symbols whose code is dropped. Please make the retrieved code actually show up in the pack's code excerpt.",
+    "mutations": [
+      [
+        "pandemonium/retrieval/context_packer.py",
+        "        excerpt = (top.content or \"\")[:max_chunk_chars]",
+        "        excerpt = (top.content or \"\")[max_chunk_chars:]"
+      ]
+    ]
+  },
+  {
+    "id": "ledger_add_dedupe_bypass",
+    "prompt": "Session memory is accumulating duplicate entries. When the same search query is issued twice within a single session, it gets recorded twice instead of once â€” repeated identical items are no longer collapsed to a single entry, so the stored list grows with exact duplicates. Expected behavior is that recording the same value again is a no-op and the list contains it only once.",
+    "mutations": [
+      [
+        "pandemonium/session.py",
+        "        lst = self.data.setdefault(field, [])\n        if value and value not in lst:",
+        "        lst = self.data.setdefault(field, [])\n        if value or value not in lst:"
+      ]
+    ]
+  },
+  {
+    "id": "query_tokens_drop_first",
+    "prompt": "Searching for something by typing just its exact name (a single bare identifier) no longer takes the fast path. Instead of returning the matching item directly with a top, maximal relevance score, the search falls through to the full pipeline and spins up the heavy embedding model, which should never happen for a lone-identifier lookup. The returned item ends up with a weak, non-maximal score even though it's an exact name match. Multi-word/natural-language searches still return their expected results.",
+    "mutations": [
+      [
+        "pandemonium/retrieval/symbol_search.py",
+        "    return seen",
+        "    return seen[1:]"
+      ]
+    ]
+  },
+  {
+    "id": "partition_tests_ref_vs_path",
+    "prompt": "When I request a brief for a task, a test that is a confirmed caller of the target symbol â€” and is already listed under the verified/related tests â€” ALSO shows up in the \"unverified / name-matched tests\" section. The exact same test ends up in both places at once. A test that's been confirmed as a real caller should never also be presented as an unverified, name-matched-only guess; it's being double-counted and the unverified section is no longer trustworthy as \"not graph-confirmed.\"",
+    "mutations": [
+      [
+        "pandemonium/brief.py",
+        "    name_only = [t for t in plan.get(\"tests\", []) if _ref_path(t) not in caller_paths]",
+        "    name_only = [t for t in plan.get(\"tests\", []) if t not in caller_paths]"
+      ]
+    ]
+  },
+  {
+    "id": "test_path_substring_false_positive",
+    "prompt": "Source files that merely contain \"test\"/\"tests\"/\"spec\" as part of a larger word are being misclassified as test files. For example, files named contest.cpp, latest.cpp, and fastest.h are all reported as tests even though none of them are. The classifier should only treat a path as a test when one of those words appears as a standalone token (including across camelCase boundaries, e.g. CalculatorTests.cs), not as an arbitrary substring of another word. Please fix the over-eager matching so ordinary files whose names happen to embed those letters are no longer flagged as tests.",
+    "mutations": [
+      [
+        "pandemonium/retrieval/tests_finder.py",
+        "    return bool(_name_tokens(base) & _TEST_TOKENS)",
+        "    return any(t in base.lower() for t in _TEST_TOKENS)"
+      ]
+    ]
+  }
+]

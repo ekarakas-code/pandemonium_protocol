@@ -1,0 +1,538 @@
+## Summary
+
+Yes — **you can achieve a reference-based code and logic map with the current architecture**, but only if you add one missing layer:
+
+> Current architecture gives you **cards + stable refs + scopes + summaries + tags + exact fetch**.
+> To build a real code/logic map, you need to add a **relationship graph layer** on top of those refs.
+
+Your current PandemoniumProtocol already has the right foundation because each record can carry `ref`, `scope`, `qualified_name`, `parent`, `tags`, and stored code fetched by `repo_get`. 
+That is enough to identify “things.” The next step is to identify **how those things affect each other**.
+
+---
+
+# What You Want to Build
+
+You want something like:
+
+```text
+Class A
+ ├─ calls Function B
+ ├─ reads Config C
+ ├─ writes File D
+ ├─ depends on Interface E
+ └─ affected by Route F
+```
+
+Or for an update:
+
+```text
+If I change AuthService.validateToken:
+
+Directly affected:
+- AuthMiddleware.requireAuth
+- UserSession.refresh
+- JwtClaimsParser.parse
+
+Indirectly affected:
+- LoginController
+- AdminRoutes
+- Auth tests
+- API docs
+
+Risk:
+- token refresh behavior may break
+- middleware error handling may change
+```
+
+That is not just vector search anymore. That is a **code intelligence graph**.
+
+---
+
+# Can Current Architecture Support It?
+
+## Yes, because you already have the right nodes
+
+Your current card model can become graph nodes:
+
+```text
+Node = card/ref
+```
+
+Examples:
+
+```text
+src/auth/AuthService.ts::AuthService.validateToken
+src/routes/authRoutes.ts::POST /login
+src/config/auth.ts::JWT_EXPIRY
+src/tests/auth.test.ts::validateToken expired token test
+```
+
+Each node has:
+
+* stable ref
+* path
+* scope
+* qualified name
+* language
+* summary
+* tags
+* stored code
+* line range as display metadata
+
+That is exactly what a graph needs.
+
+---
+
+## But you need to add edges
+
+The missing part is:
+
+```text
+Edge = relationship between refs
+```
+
+Example edges:
+
+```text
+A calls B
+A imports B
+A instantiates B
+A inherits B
+A implements B
+A reads config C
+A writes table/file/resource D
+A is tested by Test E
+A is documented by Doc F
+A is exposed by Route G
+A handles Event H
+```
+
+So the architecture becomes:
+
+```text
+Card index + Vector search + Stable refs
+             +
+        Relationship graph
+             =
+Reference-based code and logic map
+```
+
+---
+
+# Recommended Graph Model
+
+## 1. Nodes
+
+Keep nodes based on your existing refs.
+
+Recommended node types:
+
+| Node Type             | Example                     |
+| --------------------- | --------------------------- |
+| `file`                | `src/auth/AuthService.ts`   |
+| `class`               | `AuthService`               |
+| `function` / `method` | `AuthService.validateToken` |
+| `interface`           | `IAuthProvider`             |
+| `route`               | `POST /api/login`           |
+| `test`                | `auth.test::expired token`  |
+| `config`              | `JWT_EXPIRY`                |
+| `database_table`      | `users`                     |
+| `event`               | `UserLoggedIn`              |
+| `command`             | `pandemonium index`         |
+
+Your current `scope` field already starts this. I would expand it from:
+
+```text
+file | symbol | code
+```
+
+to something richer:
+
+```text
+file | class | function | method | route | test | config | doc | data | command
+```
+
+You do not need all of them immediately, but the model should allow them.
+
+---
+
+## 2. Edges
+
+This is the most important part.
+
+Recommended edge types:
+
+| Edge Type      | Meaning                             |
+| -------------- | ----------------------------------- |
+| `contains`     | file contains class/function        |
+| `imports`      | file imports another module         |
+| `calls`        | function calls another function     |
+| `instantiates` | creates class/object                |
+| `inherits`     | class extends class                 |
+| `implements`   | class implements interface          |
+| `reads`        | reads config/env/file/db            |
+| `writes`       | writes file/db/state                |
+| `throws`       | may raise/throw error               |
+| `handles`      | handles route/event/command         |
+| `tested_by`    | production code covered by test     |
+| `documents`    | doc describes symbol/file           |
+| `similar_to`   | semantically similar implementation |
+| `affects`      | derived impact relation             |
+| `depends_on`   | broad dependency edge               |
+| `owned_by`     | module ownership/domain             |
+
+The core edge types to start with:
+
+```text
+contains
+imports
+calls
+depends_on
+tested_by
+handles
+reads
+writes
+```
+
+That is enough for impact analysis.
+
+---
+
+# Static Graph vs Logic Graph
+
+You should distinguish two layers:
+
+## 1. Static Code Graph
+
+This is mechanically extracted.
+
+Examples:
+
+```text
+AuthController.login calls AuthService.login
+AuthService.login calls JwtService.sign
+AuthService imports UserRepository
+AuthService is tested by AuthServiceTest
+```
+
+This can be built with AST/parsers.
+
+It is more reliable.
+
+---
+
+## 2. Logic/Semantic Graph
+
+This is inferred.
+
+Examples:
+
+```text
+AuthService.login affects user session creation
+JwtService.sign affects token validity
+Changing JWT_EXPIRY affects login persistence
+UserRepository.findByEmail affects authentication correctness
+```
+
+This is where Claude/LLM enrichment helps.
+
+It is more useful, but less certain.
+
+So store confidence:
+
+```text
+edge_type: "affects"
+source: "AuthService.login"
+target: "UserSession"
+confidence: 0.72
+origin: "llm_inferred"
+evidence_refs: [...]
+```
+
+Important principle:
+
+> Static edges are truth-like. Logic edges are hypotheses with evidence.
+
+---
+
+# How This Fits PandemoniumProtocol
+
+Your architecture should become four connected indexes:
+
+```text
+1. Symbol/Card Index
+   - refs
+   - summaries
+   - tags
+   - descriptors
+   - embeddings
+
+2. Source Store
+   - exact code by ref
+   - file snapshots
+   - content hashes
+
+3. Relationship Graph
+   - nodes = refs
+   - edges = calls/imports/reads/writes/tests/etc.
+
+4. Session Ledger
+   - what Claude already found
+   - fetched refs
+   - edited files
+   - confirmed facts
+   - open risks
+```
+
+This would make Pandemonium much stronger than normal RAG.
+
+---
+
+# What Claude Skill Could Do With This
+
+The Claude Skill could expose graph-aware commands conceptually like:
+
+```text
+repo_search("token validation")
+```
+
+Returns relevant cards.
+
+```text
+repo_get("src/auth/AuthService.ts::AuthService.validateToken")
+```
+
+Returns exact code.
+
+```text
+repo_graph("src/auth/AuthService.ts::AuthService.validateToken", depth=2)
+```
+
+Returns callers, callees, imports, tests, configs.
+
+```text
+repo_impact("src/auth/AuthService.ts::AuthService.validateToken")
+```
+
+Returns what may break if this changes.
+
+```text
+repo_logic_map("authentication")
+```
+
+Returns conceptual flow across files/classes/functions.
+
+This is exactly what you want for reducing token usage. Claude does not need to inspect every file manually; it asks the graph:
+
+> “What depends on this?”
+> “What calls this?”
+> “What tests this?”
+> “What files are logically affected?”
+
+---
+
+# The Best Design: Reference-Based Impact Map
+
+For every ref, you want an impact map like this:
+
+```text
+Ref:
+AuthService.validateToken
+
+Direct code relations:
+- called by AuthMiddleware.requireAuth
+- calls JwtService.verify
+- reads AUTH_SECRET
+- throws TokenExpiredError
+
+File relations:
+- defined in src/auth/AuthService.ts
+- imported by src/middleware/AuthMiddleware.ts
+- tested by tests/auth/AuthService.test.ts
+
+Logic relations:
+- affects request authentication
+- affects admin route access
+- affects session expiration behavior
+
+Risk areas:
+- expired token handling
+- refresh token compatibility
+- middleware HTTP status codes
+
+Recommended fetches:
+1. AuthMiddleware.requireAuth
+2. JwtService.verify
+3. AuthService.test expired-token cases
+```
+
+That is the kind of output Claude can use immediately.
+
+---
+
+# What Needs to Be Added
+
+Your current architecture is enough for the **reference/card layer**. To achieve the code and logic map, add these pieces:
+
+## 1. Graph table/storage
+
+You need a graph representation.
+
+Can be simple at first:
+
+```text
+nodes table
+edges table
+```
+
+No need for Neo4j immediately unless the graph becomes complex.
+
+Start with SQLite:
+
+```text
+nodes:
+- ref
+- kind
+- path
+- qualified_name
+- summary
+- tags
+- content_hash
+
+edges:
+- source_ref
+- target_ref
+- edge_type
+- confidence
+- origin
+- evidence
+```
+
+Later, if needed, move to a graph database.
+
+---
+
+## 2. AST-based extractor
+
+For each language, extract:
+
+* classes
+* functions
+* methods
+* imports
+* calls
+* inheritance
+* decorators/annotations
+* routes if possible
+* tests if possible
+
+This creates reliable static edges.
+
+For Python, this is easier.
+For JS/TS, C#, C++, it becomes more complex but still achievable.
+
+---
+
+## 3. LLM logic enricher
+
+Claude can infer higher-level logic relations:
+
+```text
+this function validates request identity
+this class owns user session creation
+this file coordinates database writes
+this function affects payment authorization
+```
+
+But store those as lower-confidence inferred edges.
+
+---
+
+## 4. Impact analyzer
+
+This is where the graph becomes useful.
+
+Given a ref, it should answer:
+
+```text
+What calls this?
+What does this call?
+What files import this?
+What tests cover this?
+What configs/data does this touch?
+What routes/commands expose this?
+What should Claude inspect before editing?
+```
+
+This becomes the real power tool for sessions and parallel agents.
+
+---
+
+# How Parallel Agents Use the Map
+
+Instead of each agent searching blindly, the main agent can assign graph-based tasks:
+
+```text
+Agent 1:
+Inspect callers of AuthService.validateToken.
+
+Agent 2:
+Inspect tests and missing test coverage.
+
+Agent 3:
+Inspect configs and environment dependencies.
+
+Agent 4:
+Inspect similar auth flows.
+```
+
+Each agent starts from known refs, not from vague search.
+
+That massively reduces token usage and duplicate work.
+
+---
+
+# Suggested Architecture Upgrade
+
+Your architecture should evolve like this:
+
+```text
+Current:
+Embeddings + cards + stable refs + repo_get
+
+Next:
+Embeddings + cards + stable refs + repo_get
+    + static graph
+    + logic graph
+    + impact analyzer
+    + session-aware graph cache
+```
+
+The key addition is:
+
+```text
+ref -> relationships -> affected refs -> recommended fetches
+```
+
+---
+
+# Final Verdict
+
+Yes, you can achieve it with the current architecture.
+
+But to be precise:
+
+> Current architecture is sufficient for the **nodes** of the map.
+> You need to add a **relationship/edge graph** to represent calls, imports, dependencies, tests, configs, side effects, and inferred logic effects.
+
+Do this in stages:
+
+1. **Stable refs/cards first**
+2. **Static AST graph**
+3. **Basic impact map**
+4. **Test/config/route links**
+5. **LLM-inferred logic graph**
+6. **Claude Skill integration**
+7. **Parallel-agent graph workflows**
+
+That would turn PandemoniumProtocol from a retrieval system into a real **agentic code intelligence layer**.

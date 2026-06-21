@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pandemonium": {
+      "command": "D:\\PandemoniumProtocol\\.venv\\Scripts\\pandemonium.exe",
+      "args": ["serve-mcp", "--repo", "."]
+    }
+  }
+}
