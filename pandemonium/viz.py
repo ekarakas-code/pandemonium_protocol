@@ -634,8 +634,14 @@ function focusRef(){ if(!DATA.focus) return;
   if(n.length){ const hood=n.closedNeighborhood();
     cy.elements().addClass('faded'); hood.removeClass('faded'); n.ancestors().removeClass('faded');
     n.select(); cy.animate({ fit:{ eles:hood, padding:80 }, duration:500 }); showDetail(n[0]); } }
+// Set filter display states first; then for a collapsed start, fold the hierarchy BEFORE the
+// main layout so fcose arranges only the top-level folder boxes (fast on a big repo) instead of
+// every symbol — expanding a folder then lays out just its children on demand. Without this,
+// --collapsed still paid the full-graph layout up front (the big-graph perf complaint).
+applyFilters();
+if(DATA.collapsed) ec.collapseAll();
 const initial = cy.layout(fcoseOpts());
-initial.one('layoutstop', ()=>{ applyFilters(); if(DATA.collapsed) ec.collapseAll(); focusRef(); });
+initial.one('layoutstop', ()=>{ focusRef(); });
 initial.run();
 </script>
 </body>
