@@ -10,7 +10,8 @@ comes from `symbols.file_id`/`parent`; `tested_by` from `find_tests`.) Call edge
 a receiver (`self` / a name / an expr) so the query-time resolver can disambiguate the
 many same-named methods (e.g. six `.search`es in this repo) instead of name-colliding.
 
-Extraction is per-language (see EDGE_SPECS): Python, C++, C#, and JS/TS each contribute
+Extraction is per-language (see EDGE_SPECS + the Dart custom extractor): Python, C++, C#,
+Dart, and JS/TS each contribute
 their call/import/inherit node-types. Resolution is language-scoped — a call in one
 language never resolves to a same-named symbol in another. Languages without a spec index
 symbols normally but carry no edges (surfaced via `edges_available`).
@@ -110,8 +111,15 @@ def _class_bases(node, src: bytes) -> List[str]:
     sup = node.child_by_field_name("superclasses")
     if sup is None:
         return []
-    return [tsp._text(src, c).split(".")[-1] for c in sup.children
-            if c.type in ("identifier", "attribute")]
+    out: List[str] = []
+    for c in sup.children:
+        if c.type in ("identifier", "attribute"):
+            out.append(tsp._text(src, c).split(".")[-1])
+        elif c.type == "subscript":  # Generic[T], Protocol[T], Sequence[int] -> base name
+            val = c.child_by_field_name("value")
+            if val is not None:
+                out.append(tsp._text(src, val).split(".")[-1])
+    return out
 
 
 def _callee_py(call_node, src: bytes):
@@ -226,7 +234,17 @@ def _cs_name(node, src: bytes) -> Optional[str]:
 def _callee_csharp(call_node, src: bytes):
     """C# `invocation_expression` -> (name, kind, receiver). this.M()->this;
     Type.M()->qualified (static/nested); obj.M()->expr; M()->bare. Generic forms
-    (`M<T>()`, `obj.M<T>()`) resolve to the bare name `M`."""
+    (`M<T>()`, `obj.M<T>()`) resolve to the bare name `M`. Also handles `new T()`
+    (`object_creation_expression`) -> the constructed type as a bare call, so a type's
+    constructor surfaces its instantiation sites."""
+    if call_node.type == "object_creation_expression":
+        ty = call_node.child_by_field_name("type")
+        if ty is None:
+            return None, "bare", ""
+        name = _cs_name(ty, src)
+        if name is None:  # qualified_name (Ns.Type) / nested
+            name = tsp._text(src, ty).split(".")[-1].split("<")[0]
+        return (name, "bare", "") if name else (None, "bare", "")
     fn = call_node.child_by_field_name("function")
     if fn is None:
         return None, "bare", ""
@@ -254,18 +272,30 @@ def _imports_csharp(node, src: bytes) -> List[str]:
 
 
 def _bases_csharp(node, src: bytes) -> List[str]:
-    """Base class + interfaces from a `base_list` (C# mixes both)."""
+    """Base class + interfaces from a `base_list` (C# mixes both). Generic args are stripped
+    (`IComparable<C>` -> `IComparable`) so the edge resolves to the base symbol."""
     clause = next((c for c in node.children if c.type == "base_list"), None)
     if clause is None:
         return []
-    return [tsp._text(src, c).split(".")[-1] for c in clause.children
+    return [tsp._text(src, c).split(".")[-1].split("<")[0] for c in clause.children
             if c.type in ("identifier", "qualified_name", "generic_name")]
 
 
 # --- JavaScript / TypeScript extractors --------------------------------------
 def _callee_js(call_node, src: bytes):
     """JS/TS `call_expression` -> (name, kind, receiver). this.m()->this;
-    obj.m()->expr; m()->bare."""
+    obj.m()->expr; m()->bare. Also `new T()` (`new_expression`) -> the constructed type
+    as a bare call, so a class surfaces its instantiation sites."""
+    if call_node.type == "new_expression":
+        ctor = call_node.child_by_field_name("constructor")
+        if ctor is None:
+            return None, "bare", ""
+        if ctor.type == "identifier":
+            return tsp._text(src, ctor), "bare", ""
+        if ctor.type == "member_expression":
+            prop = ctor.child_by_field_name("property")
+            return (tsp._text(src, prop), "expr", "") if prop is not None else (None, "bare", "")
+        return None, "bare", ""
     fn = call_node.child_by_field_name("function")
     if fn is None:
         return None, "bare", ""
@@ -306,14 +336,171 @@ def _bases_js(node, src: bytes) -> List[str]:
     out: List[str] = []
 
     def walk(n) -> None:
+        if n.type == "type_arguments":
+            return  # don't descend into generic args: `extends Container<Item>` -> Container, not Item
         if n.type in ("identifier", "type_identifier"):
             out.append(tsp._text(src, n).split(".")[-1])
+            return
         for c in n.children:
             walk(c)
 
     for c in clause.children:
         walk(c)
     return out
+
+
+# --- Dart extractors ---------------------------------------------------------
+# Dart's grammar (tree-sitter-dart 0.1.0) has no `call_expression`: a call is a postfix
+# chain `<receiver> selector(.name)? selector(argument_part)`, and a CASCADE call is
+# `<target> cascade_section[cascade_selector(.name) argument_part]`. So calls are found by
+# scanning `argument_part` nodes and reading the call name from the preceding selector (or
+# the cascade_selector). Inherits come from class_definition's superclass (extends + `with`
+# mixins) / interfaces (implements); imports from the library_import URI stem.
+_DART_CONF = {"this": 0.9, "expr": 0.5, "bare": 0.6}
+
+
+def _dart_callee(arg_part, src: bytes):
+    """`argument_part` -> (name, kind, receiver). this.h()->this; a.b()->expr; g()->bare;
+    cascade `t..m()`->expr (recv=t, Flutter builder pattern); chained `a.b().c()`->c with
+    recv falling back to the chain base rather than the intermediate call's `()`."""
+    par = arg_part.parent
+    if par is None:
+        return None, "bare", ""
+
+    # Cascade: target..name(args)  ->  cascade_section[cascade_selector(name), argument_part]
+    if par.type == "cascade_section":
+        csel = _dart_first(par, "cascade_selector")
+        ident = _dart_first(csel, "identifier") if csel is not None else None
+        if ident is None:
+            return None, "bare", ""
+        name = tsp._text(src, ident)
+        gp = par.parent
+        base = next((c for c in gp.children if c.is_named), None) if gp is not None else None
+        if base is not None and base.type == "this":
+            return name, "this", "this"
+        return name, "expr", tsp._text(src, base) if base is not None else ""
+
+    if par.type != "selector":
+        return None, "bare", ""
+    chain = par.parent
+    if chain is None:
+        return None, "bare", ""
+    kids = [c for c in chain.children if c.is_named]
+    try:
+        idx = kids.index(par)
+    except ValueError:
+        return None, "bare", ""
+    if idx == 0:
+        return None, "bare", ""
+    prev = kids[idx - 1]
+    if prev.type == "selector":  # method call: <recv> .name (...)
+        asel = _dart_first(prev, "unconditional_assignable_selector",
+                           "conditional_assignable_selector")
+        ident = _dart_first(asel, "identifier") if asel is not None else None
+        if ident is None:
+            return None, "bare", ""
+        name = tsp._text(src, ident)
+        recv = kids[idx - 2] if idx - 2 >= 0 else None
+        if recv is not None and recv.type in ("identifier", "this"):
+            return (name, "this", "this") if recv.type == "this" else (name, "expr", tsp._text(src, recv))
+        # chained call (recv would be an intermediate `()` selector) -> use the chain base
+        base = next((k for k in kids[:idx] if k.type in ("identifier", "this")), None)
+        if base is not None and base.type == "this":
+            return name, "this", "this"
+        return name, "expr", tsp._text(src, base) if base is not None else ""
+    if prev.type == "identifier":  # bare call: g(...)
+        return tsp._text(src, prev), "bare", ""
+    return None, "bare", ""
+
+
+def _dart_first(node, *types):
+    if node is None:
+        return None
+    return next((c for c in node.children if c.type in types), None)
+
+
+def _imports_dart(node, src: bytes) -> List[str]:
+    """`import 'package:p/foo.dart';` -> ['foo'] (URI basename stem, drops .dart)."""
+    uri = tsp._find_descendant(node, "uri")
+    if uri is None:
+        return []
+    raw = tsp._text(src, uri).strip().strip("'").strip('"').strip()
+    if not raw:
+        return []
+    stem = raw.replace(":", "/").rsplit("/", 1)[-1]
+    if stem.endswith(".dart"):
+        stem = stem[:-5]
+    return [stem] if stem else []
+
+
+def _bases_dart(node, src: bytes) -> List[str]:
+    """extends + `with` mixins (superclass field) and implements (interfaces field)."""
+    out: List[str] = []
+    sup = node.child_by_field_name("superclass")
+    if sup is not None:
+        for c in sup.children:
+            if c.type == "type_identifier":
+                out.append(tsp._text(src, c).split(".")[-1])
+            elif c.type == "mixins":
+                out.extend(tsp._text(src, mc).split(".")[-1]
+                           for mc in c.children if mc.type == "type_identifier")
+    iface = node.child_by_field_name("interfaces")
+    if iface is not None:
+        out.extend(tsp._text(src, c).split(".")[-1]
+                   for c in iface.children if c.type == "type_identifier")
+    return out
+
+
+def _extract_edges_dart(source: bytes, symbols, file_id: str, repo_id: str) -> List[dict]:
+    """Dart edges via a custom walk (no generic call_types node — see _dart_callee)."""
+    try:
+        tree = tsp._get_parser("dart").parse(source)
+    except Exception:
+        return []
+    funcs = [s for s in symbols if s.symbol_type in ("function", "method")]
+    classes: Dict[int, object] = {}
+    for s in symbols:
+        if s.symbol_type == "class":
+            classes.setdefault(s.start_line, s)
+
+    def enclosing(line: int):
+        best = None
+        for s in funcs:
+            if s.start_line <= line <= s.end_line and (best is None or s.start_line > best.start_line):
+                best = s
+        return best
+
+    rows: List[dict] = []
+    seen = set()
+
+    def add(row: dict) -> None:
+        if row["id"] not in seen:
+            seen.add(row["id"])
+            rows.append(row)
+
+    stack = [tree.root_node]
+    while stack:
+        n = stack.pop()
+        t = n.type
+        if t == "library_import":
+            for nm in _imports_dart(n, source):
+                add(_row(repo_id, file_id, "file", file_id, "imports", nm, target_type="module"))
+        elif t == "class_definition":
+            cls = classes.get(n.start_point[0] + 1)
+            if cls is not None:
+                for base in _bases_dart(n, source):
+                    add(_row(repo_id, file_id, "symbol", cls.id, "inherits", base,
+                             target_type="class"))
+        elif t == "argument_part":
+            name, kind, recv = _dart_callee(n, source)
+            if name:
+                enc = enclosing(n.start_point[0] + 1)
+                if enc is not None:
+                    add(_row(repo_id, file_id, "symbol", enc.id, "calls", name, recv, kind,
+                             _DART_CONF.get(kind, 0.5)))
+        for c in n.children:
+            stack.append(c)
+    return rows
 
 
 @dataclass
@@ -343,35 +530,39 @@ EDGE_SPECS: Dict[str, _EdgeSpec] = {
         ("class_specifier", "struct_specifier"), _bases_cpp,
         {"this": 0.9, "qualified": 0.75, "expr": 0.5, "bare": 0.6}),
     "c_sharp": _EdgeSpec(
-        ("invocation_expression",), _callee_csharp,
+        ("invocation_expression", "object_creation_expression"), _callee_csharp,
         ("using_directive",), _imports_csharp,
         ("class_declaration", "record_declaration", "struct_declaration"), _bases_csharp,
         {"this": 0.9, "qualified": 0.75, "expr": 0.5, "bare": 0.6}),
     "javascript": _EdgeSpec(
-        ("call_expression",), _callee_js,
+        ("call_expression", "new_expression"), _callee_js,
         ("import_statement",), _imports_js,
         ("class_declaration",), _bases_js,
         {"this": 0.9, "qualified": 0.75, "expr": 0.5, "bare": 0.6}),
     "typescript": _EdgeSpec(
-        ("call_expression",), _callee_js,
+        ("call_expression", "new_expression"), _callee_js,
         ("import_statement",), _imports_js,
-        ("class_declaration",), _bases_js,
+        ("class_declaration", "abstract_class_declaration"), _bases_js,
         {"this": 0.9, "qualified": 0.75, "expr": 0.5, "bare": 0.6}),
     "tsx": _EdgeSpec(
-        ("call_expression",), _callee_js,
+        ("call_expression", "new_expression"), _callee_js,
         ("import_statement",), _imports_js,
-        ("class_declaration",), _bases_js,
+        ("class_declaration", "abstract_class_declaration"), _bases_js,
         {"this": 0.9, "qualified": 0.75, "expr": 0.5, "bare": 0.6}),
 }
 
 # Languages whose graph edges are extracted (drives the honesty notice for the rest).
-EDGE_LANGUAGES = set(EDGE_SPECS)
+# Dart is included via its custom extractor (not an EDGE_SPECS entry). html/css are
+# deliberately absent — they get symbols but the honest "edges not extracted" notice.
+EDGE_LANGUAGES = set(EDGE_SPECS) | {"dart"}
 
 
 def extract_edges(source: bytes, language: str, symbols, file_id: str, path: str,
                   repo_id: str) -> List[dict]:
     """Return relationship rows (ready for SqliteStore.insert_relationships). Dispatches
     on the per-language EDGE_SPECS entry; languages without a spec extract no edges."""
+    if language == "dart":
+        return _extract_edges_dart(source, symbols, file_id, repo_id)
     spec = EDGE_SPECS.get(language)
     if spec is None or not is_parseable(language):
         return []
@@ -812,8 +1003,8 @@ def render_graph(g: dict, show_evidence: bool = False) -> str:
     out = [f"# Graph: {g['ref']}  [{g['type']}]"]
     if g.get("edges_available") is False:
         out.append(
-            "\n> Note: call/import/inherit edges are extracted for **Python, C++, C#, and "
-            "JS/TS**. This file's language isn't among them, so empty Calls / Called-by / "
+            "\n> Note: call/import/inherit edges are extracted for **Python, C++, C#, Dart, "
+            "and JS/TS**. This file's language isn't among them, so empty Calls / Called-by / "
             "Imports below mean edges were never extracted — NOT that none exist. Don't "
             "read this as 'no callers'.")
 
@@ -925,7 +1116,7 @@ def render_impact(g: dict) -> str:
     out = [f"# Impact of changing {g['ref']}"]
     if g.get("edges_available") is False:
         out.append(
-            "\n> Note: impact analysis covers **Python, C++, C#, and JS/TS**. This file's "
+            "\n> Note: impact analysis covers **Python, C++, C#, Dart, and JS/TS**. This file's "
             "language isn't among them, so an empty result means caller edges were never "
             "extracted — NOT that nothing depends on it. Verify manually before assuming "
             "it's safe to change.")
@@ -1007,7 +1198,7 @@ def _edit_risks(settings, ref: str, g: dict, imp: dict, tests: List[str]) -> Lis
     risks: List[str] = []
     if not g.get("edges_available", True):
         risks.append("Graph edges aren't extracted for this file's language (covered: "
-                     "Python, C++, C#, JS/TS) — the caller list is NOT reliable. Search "
+                     "Python, C++, C#, Dart, JS/TS) — the caller list is NOT reliable. Search "
                      "for callers manually before changing behavior.")
     direct = imp.get("direct", [])
     if len(direct) >= 5:

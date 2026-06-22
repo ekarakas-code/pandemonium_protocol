@@ -87,8 +87,10 @@ change affects), **`repo_edit_plan`** (ranked "how to change this"), **`repo_log
 `repo_find_tests`, `repo_session` (session ledger), `repo_changed` (staleness),
 `repo_reindex_changed`. All read-only except
 reindex; every call is audit-logged. Static call/import/inherit graph edges are extracted
-for **Python, C++, C#, and JS/TS** (resolution is language-scoped); other languages still
-index symbols and surface an explicit "edges not extracted" notice.
+for **Python, C++, C#, Dart, and JS/TS** (resolution is language-scoped). **HTML and CSS**
+are parsed into symbol anchors (element `id`s, CSS rule selectors) but carry no edges;
+other languages still index symbols/text and surface an explicit "edges not extracted"
+notice.
 
 ## Use as a Claude **skill**
 

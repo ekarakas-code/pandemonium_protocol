@@ -20,6 +20,7 @@ EXT_LANG = {
     ".vb": "text", ".fs": "text", ".fsx": "text",  # VB.NET / F#: searchable (no grammar)
     ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
     ".ts": "typescript", ".tsx": "tsx",
+    ".dart": "dart",
     ".java": "java", ".go": "go", ".rb": "ruby", ".rs": "rust", ".php": "php",
     ".c": "c", ".h": "cpp", ".cpp": "cpp", ".cc": "cpp", ".hpp": "cpp", ".hh": "cpp",
     ".md": "markdown", ".markdown": "markdown", ".rst": "text", ".txt": "text",
@@ -31,7 +32,10 @@ EXT_LANG = {
 }
 
 # Languages we can structurally parse into symbols (Phase 6).
-PARSEABLE = {"python", "cpp", "c_sharp", "javascript", "typescript", "tsx"}
+# dart/html/css use custom extractors (see tree_sitter_parser._CUSTOM_PARSERS); only Dart
+# also contributes graph edges (see graph.EDGE_LANGUAGES) — html/css are symbols-only.
+PARSEABLE = {"python", "cpp", "c_sharp", "javascript", "typescript", "tsx",
+             "dart", "html", "css"}
 
 
 def detect(path) -> Optional[str]:

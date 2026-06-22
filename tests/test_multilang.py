@@ -264,6 +264,198 @@ def test_dotnet_file_types_detected():
     assert detect("App.sln") == "text"
 
 
+def test_dart_symbols_classes_mixins_extensions_functions():
+    src = (
+        "import 'package:flutter/material.dart';\n"
+        "class Animal {\n"
+        "  void speak() {\n"
+        "    print('hi');\n"
+        "  }\n"
+        "}\n"
+        "mixin Walker { void walk() {} }\n"
+        "extension StringX on String { int doubled() => length * 2; }\n"
+        "int topLevel(int x) { return x + 1; }\n"
+    )
+    syms, by, names = _index(src, "dart")
+    qns = {s.qualified_name for s in syms}
+    assert ("Animal", "class") in names
+    assert ("speak", "method") in names
+    assert ("Walker", "mixin") in names
+    assert ("walk", "method") in names
+    assert ("StringX", "extension") in names
+    assert ("doubled", "method") in names
+    assert ("topLevel", "function") in names
+    assert "Animal.speak" in qns
+    # body-range pairing: the method spans its multi-line body, not just the signature line
+    assert by["speak"].end_line > by["speak"].start_line
+
+
+# --- Depth improvements (Tier 1+2): symbols + edges across languages ---------
+def test_python_constants_types_decorators_and_signatures():
+    src = ("MAX = 10\n"
+           "CONFIG: dict = {}\n"
+           "Vector = list[int]\n"
+           "import typing\n"
+           "Id = typing.TypeVar('Id')\n"
+           "@staticmethod\n"
+           "def util(a,\n"
+           "         b):\n"
+           "    return a\n")
+    syms, by, names = _index(src, "python")
+    assert ("MAX", "constant") in names
+    assert ("CONFIG", "constant") in names
+    assert ("Vector", "type") in names and ("Id", "type") in names
+    # decorator surfaced in signature + start_line includes it; multi-line sig not truncated
+    assert by["util"].signature.startswith("@staticmethod def util(a, b)")
+    assert by["util"].start_line == 6
+
+
+def test_python_generic_bases_resolve(tmp_path):
+    settings = _index_dir(tmp_path, {"m.py": (
+        "from typing import Generic, TypeVar\n"
+        "T = TypeVar('T')\n"
+        "class Base: pass\n"
+        "class Mixin: pass\n"
+        "class Box(Generic[T], Mixin, Base):\n    pass\n")})
+    g = service.graph_for(settings, _ref(settings, "Box", "m.py"))
+    assert "Generic" in g["inherits"]   # subscripted base no longer dropped
+    assert "Mixin" in g["inherits"] and "Base" in g["inherits"]
+
+
+def test_csharp_fields_events_attributes_and_new(tmp_path):
+    settings = _index_dir(tmp_path, {"A.cs": (
+        "namespace N {\n"
+        "  public class Widget {}\n"
+        "  public class C {\n"
+        "    public int Count;\n"
+        "    public event System.EventHandler Done;\n"
+        "    [System.Obsolete]\n"
+        "    public int Get(int a) { var w = new Widget(); return a; }\n"
+        "  }\n}\n")})
+    assert any(s["type"] == "field" and s["qualified_name"] == "N.C.Count"
+               for s in service.symbol(settings, "Count"))
+    assert any(s["type"] == "event" for s in service.symbol(settings, "Done"))
+    # attribute no longer clobbers the signature
+    get_sym = [s for s in service.symbol(settings, "Get") if s["path"].endswith("A.cs")][0]
+    assert get_sym["signature"].startswith("public int Get")
+    # new Widget() makes the class an instantiation callee of Get
+    assert any(r.endswith("Widget") for r in _callee_refs(settings, _ref(settings, "Get", "A.cs")))
+
+
+def test_ts_arrow_consts_enums_namespace_abstract_new(tmp_path):
+    settings = _index_dir(tmp_path, {"m.ts": (
+        "export const add = (a: number, b: number): number => a + b;\n"
+        "const helper = function(){ return 1; };\n"
+        "enum Color { Red, Green }\n"
+        "namespace NS {\n"
+        "  export function inside(){ return add(1, 2); }\n"
+        "}\n"
+        "abstract class Shape {\n"
+        "  abstract area(): number;\n"
+        "  describe(){ return this.area(); }\n"
+        "}\n"
+        "class Circle extends Shape {\n"
+        "  area(){ return 1; }\n"
+        "  make(){ return new Circle(); }\n"
+        "}\n")})
+    assert any(s["type"] == "function" and s["qualified_name"] == "add"
+               for s in service.symbol(settings, "add"))     # arrow-const captured
+    assert any(s["type"] == "function" for s in service.symbol(settings, "helper"))
+    assert any(s["type"] == "enum" for s in service.symbol(settings, "Color"))
+    assert any(s["qualified_name"] == "NS.inside" for s in service.symbol(settings, "inside"))  # scoped
+    assert any(s["qualified_name"] == "Shape.area" for s in service.symbol(settings, "area"))   # abstract scoped
+    # new Circle() instantiation edge + abstract base inheritance
+    assert any(r.endswith("Circle") for r in _callee_refs(settings, _ref(settings, "make", "m.ts")))
+    assert "Shape" in service.graph_for(settings, _ref(settings, "Circle", "m.ts"))["inherits"]
+
+
+def test_dart_enums_fields_typedefs_symbols(tmp_path):
+    settings = _index_dir(tmp_path, {"a.dart": (
+        "typedef IntList = List<int>;\n"
+        "const pi = 3.14;\n"
+        "enum Color { red, green; bool get bright => true; }\n"
+        "class Config { final String host; int port = 0; }\n")})
+    assert any(s["type"] == "type" for s in service.symbol(settings, "IntList"))
+    assert any(s["type"] == "constant" and s["qualified_name"] == "pi"
+               for s in service.symbol(settings, "pi"))
+    assert any(s["type"] == "enum" for s in service.symbol(settings, "Color"))
+    assert any(s["qualified_name"] == "Color.bright"
+               for s in service.symbol(settings, "bright"))   # enhanced-enum method scoped, not leaked
+    assert any(s["type"] == "field" and s["qualified_name"] == "Config.host"
+               for s in service.symbol(settings, "host"))
+
+
+def test_dart_cascade_calls_resolve(tmp_path):
+    """Flutter builder pattern: `this..step()..step()` cascade calls produce resolving edges."""
+    settings = _index_dir(tmp_path, {"a.dart": (
+        "class A {\n"
+        "  void step() {}\n"
+        "  void run() { this..step()..step(); }\n"
+        "}\n")})
+    callees = _callee_refs(settings, _ref(settings, "run", "a.dart"))
+    assert any(r.endswith("A.step") for r in callees)
+
+
+def test_dart_constructors_factory_getter_setter():
+    """Constructors (default + named), factory constructors, and getters/setters all emit
+    symbols. Factory ctors have NO `name` field and named ctors have two — the identifier-
+    joining name strategy must capture all of them distinctly (none silently dropped)."""
+    src = ("class P {\n"
+           "  int x;\n"
+           "  P(this.x);\n"
+           "  P.named(this.x);\n"
+           "  factory P.f() => P(0);\n"
+           "  int get v => x;\n"
+           "  set v(int n) {}\n"
+           "}\n")
+    syms, _, _ = _index(src, "dart")
+    qns = {s.qualified_name for s in syms if s.symbol_type == "method"}
+    assert "P.P" in qns          # default constructor (Class.Class, like C#)
+    assert "P.named" in qns      # named constructor — NOT doubled to P.P.named
+    assert "P.f" in qns          # factory constructor (no name field) — was being dropped
+    assert "P.v" in qns          # getter/setter
+
+
+def test_dart_graph_edges(tmp_path):
+    """Dart call (bare / this. / expr), inherit (extends + with + implements), import edges."""
+    settings = _index_dir(tmp_path, {"a.dart": (
+        "import 'package:p/dep.dart';\n"
+        "class Base { void run() {} }\n"
+        "mixin M { void mix() {} }\n"
+        "class A extends Base with M implements Comparable {\n"
+        "  void go() { this.help(); run(); }\n"
+        "  void help() {}\n"
+        "}\n")})
+    callees = _callee_refs(settings, _ref(settings, "go", "a.dart"))
+    assert any(r.endswith("A.help") for r in callees)    # this.help()
+    assert any(r.endswith("Base.run") for r in callees)   # bare run() (same-file, scoped)
+    a = service.graph_for(settings, _ref(settings, "A", "a.dart"))
+    assert "Base" in a["inherits"]        # extends
+    assert "M" in a["inherits"]           # with mixin
+    assert "Comparable" in a["inherits"]  # implements
+    assert "dep" in a["imports"]          # import 'package:p/dep.dart' -> stem
+    assert a["edges_available"] is True
+
+
+def test_html_css_symbols_but_no_edges(tmp_path):
+    """HTML id anchors and CSS rule_sets are searchable symbols; neither carries graph
+    edges, so the honest 'edges not extracted' state holds (edges_available False)."""
+    settings = _index_dir(tmp_path, {
+        "page.html": '<div id="main"><span id="title">hi</span></div>',
+        "style.css": ".box { color: red; }\n#nav a:hover { top: 0; }\n",
+    })
+    assert any(s["type"] == "element" for s in service.symbol(settings, "#main"))
+    assert any(s["type"] == "rule" for s in service.symbol(settings, ".box"))
+    g = service.graph_for(settings, _ref(settings, "#main", "page.html"))
+    assert g is None or g["edges_available"] is False
+
+
+def test_dart_detected_and_parseable():
+    from pandemonium.indexer.language_detector import detect, is_parseable
+    assert detect("main.dart") == "dart"
+    assert is_parseable("dart") and is_parseable("html") and is_parseable("css")
+
+
 def test_js_ts_graph_edges(tmp_path):
     settings = _index_dir(tmp_path, {
         "m.ts": ("import {z} from './dep';\n"
