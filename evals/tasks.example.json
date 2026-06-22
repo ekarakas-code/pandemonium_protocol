@@ -1,0 +1,29 @@
+{
+  "_doc": "External retrieval task set (#9). Run: `python evals/run_eval.py --repo <PATH> --tasks evals/tasks.example.json [--baselines | --save <label> | --gate <label>]`. Index the target repo FIRST: `pandemonium index <PATH>`. Schema: `queries`=[{q, files (POSIX path substrings the result path must contain), symbols (bare symbol names)}]; optional `impact`=[{ref: 'path::Qualified.Name', true_direct: [refs]}] for repo_impact FP/FN. The examples below target THIS repo so the loader is runnable as-is; for the real measurement, REPLACE them with CROSS-FILE tasks authored for your LARGE repo — the regime where the protocol is predicted to win. NOTE: this measures RETRIEVAL RANKING (precision@k/MRR). The token/cost-at-scale win is AGENT-level and lives in evals/ab_runner.py (seeded-bug tasks) — see docs RESULTS.md '#9' for the remaining half.",
+  "queries": [
+    {
+      "q": "trace how a search query flows from the CLI through the retriever into the stores",
+      "files": ["cli/main.py", "retrieval/hybrid_search.py", "storage/sqlite_store.py"],
+      "symbols": ["search", "Retriever"]
+    },
+    {
+      "q": "how is a low-confidence result set detected and then recovered by fanning out",
+      "files": ["retrieval/confidence.py", "retrieval/hybrid_search.py"],
+      "symbols": ["assess", "rerank_by_coverage"]
+    },
+    {
+      "q": "where does indexing turn a parsed symbol into an embedded descriptor",
+      "files": ["indexer/index_runner.py", "descriptor.py"],
+      "symbols": ["build_descriptor"]
+    }
+  ],
+  "impact": [
+    {
+      "ref": "pandemonium/graph.py::GraphIndex.resolve_call",
+      "true_direct": [
+        "pandemonium/graph.py::_callees_of",
+        "pandemonium/graph.py::_callers_of"
+      ]
+    }
+  ]
+}

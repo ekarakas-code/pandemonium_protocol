@@ -276,28 +276,35 @@ class Retriever:
 
     def search(self, query: str, top_k: Optional[int] = None,
                chunk_types: Optional[set] = None,
-               dedup: bool = True, mode: Optional[str] = None) -> List[SearchResult]:
+               dedup: bool = True, mode: Optional[str] = None,
+               channels_only: Optional[set] = None) -> List[SearchResult]:
         """Ranked cards for a query. Thin wrapper over `search_assessed` that drops the
         confidence verdict — kept for the many callers that only want the results."""
         results, _ = self.search_assessed(query, top_k=top_k, chunk_types=chunk_types,
-                                           dedup=dedup, mode=mode)
+                                           dedup=dedup, mode=mode,
+                                           channels_only=channels_only)
         return results
 
     def search_assessed(self, query: str, top_k: Optional[int] = None,
                         chunk_types: Optional[set] = None,
-                        dedup: bool = True, mode: Optional[str] = None
+                        dedup: bool = True, mode: Optional[str] = None,
+                        channels_only: Optional[set] = None
                         ) -> Tuple[List[SearchResult], dict]:
         """`search` + a confidence verdict (ROADMAP v2 Step 2). Runs the base hybrid
         search, then `confidence.assess`; on a LOW-confidence verdict (top hits clustered
         on one symbol family while a query domain term is uncovered — the measured
         `.size()` failure) it auto-fans-out per-term sub-queries and re-ranks the union by
         domain coverage. The exact-symbol fast path is high-confidence by construction and
-        never fans out. Scope-filtered searches keep the simple path."""
+        never fans out. Scope-filtered searches keep the simple path.
+
+        `channels_only` (eval channel-isolation baselines, e.g. {"vector"}) runs ONLY those
+        channels and bypasses both the short-circuit and the fan-out — those are hybrid
+        behaviours, so a single-channel baseline must measure the channel alone."""
         r = self.settings.section("retrieval")
         top_k = top_k or r.get("final_top_k", 10)
         # Bare-identifier exact-symbol queries short-circuit the vector model load.
-        # Only when no scope filter is active (the filter path needs the full merge).
-        if chunk_types is None:
+        # Only when no scope filter / channel isolation is active (those need the full path).
+        if chunk_types is None and channels_only is None:
             shorted = self._exact_short_circuit(query, top_k)
             if shorted:
                 a = {"confidence": "high", "reason": "exact symbol match",
@@ -306,10 +313,10 @@ class Retriever:
                 self.last_assessment = a
                 return shorted, a
 
-        results = self._base_search(query, top_k, chunk_types, dedup, mode)
+        results = self._base_search(query, top_k, chunk_types, dedup, mode, channels_only)
         assessment = confidence.assess(query, results)
         if (assessment["confidence"] == "low" and chunk_types is None
-                and r.get("auto_fanout", True)):
+                and channels_only is None and r.get("auto_fanout", True)):
             results, assessment = self._fanout(query, top_k, dedup, results, assessment, mode)
         self.last_assessment = assessment
         return results, assessment
@@ -344,22 +351,35 @@ class Retriever:
 
     def _base_search(self, query: str, top_k: int,
                      chunk_types: Optional[set], dedup: bool,
-                     mode: Optional[str] = None) -> List[SearchResult]:
+                     mode: Optional[str] = None,
+                     channels_only: Optional[set] = None) -> List[SearchResult]:
         """One hybrid pass: run channels, scope-filter, merge, build cards, dedup. No
         short-circuit, no confidence assessment — the reusable unit fan-out calls per
         sub-query. `chunk_types` restricts scopes per-channel BEFORE the merge (vector uses
         a LanceDB prefilter), so normalization is faithful to the subset. `mode` selects a
-        ranking-weight preset (Step 6); default weights when None."""
+        ranking-weight preset (Step 6); default weights when None.
+
+        `channels_only` restricts which channels run AT ALL (eval channel-isolation
+        baselines). None => all three (byte-identical to before). A symbol-only/keyword-only
+        baseline never touches `self.lance`/`self.embedder`, so it pays no model load. With a
+        single channel present the merge ranks by that channel alone (absent channels
+        contribute 0), and `_normalize`/`_identity` are monotonic — so the arm preserves that
+        channel's own ranking (a faithful vector-only / BM25-only / symbol-only baseline)."""
         r = self.settings.section("retrieval")
         where = _where_clause(chunk_types)
+        want = channels_only or {"symbol", "keyword", "vector"}
         run_symbol = chunk_types is None or bool(_SYMBOL_TYPES & set(chunk_types))
-        channels = {
-            "symbol": (symbol_search.search(self.sqlite, self.repo_id, query,
-                                            r.get("symbol_top_k", 10)) if run_symbol else []),
-            "keyword": keyword_search.search(self.sqlite, query, r.get("keyword_top_k", 20)),
-            "vector": vector_search.search(self.lance, self.embedder, query,
-                                           r.get("vector_top_k", 20), where=where),
-        }
+        channels: Dict[str, List[Tuple[str, float]]] = {}
+        if "symbol" in want:
+            channels["symbol"] = (symbol_search.search(self.sqlite, self.repo_id, query,
+                                                       r.get("symbol_top_k", 10))
+                                  if run_symbol else [])
+        if "keyword" in want:
+            channels["keyword"] = keyword_search.search(self.sqlite, query,
+                                                        r.get("keyword_top_k", 20))
+        if "vector" in want:  # property access here is the lazy model load — keep it gated
+            channels["vector"] = vector_search.search(self.lance, self.embedder, query,
+                                                      r.get("vector_top_k", 20), where=where)
 
         # One metadata fetch for every candidate — used for scope filtering AND building.
         cand = {cid for ch in channels.values() for cid, _ in ch}

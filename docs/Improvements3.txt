@@ -1,0 +1,1100 @@
+Yes — and your framing is excellent. This is not just “RAG for code.” The stronger version is:
+
+> **A local codebase intelligence layer that turns a repo into an agent-optimized working memory.**
+
+The key improvement direction is to stop thinking only in terms of “search results” and start thinking in terms of **agent task context**: what does the coding agent need to know to safely modify this repo with minimal tokens, minimal tool calls, and high confidence?
+
+Your current MVP already has the right spine:
+
+```text
+init → index → hybrid search → context pack → CLI + MCP
+```
+
+To improve it, I would focus on **six major areas**.
+
+---
+
+# 1. Make “context pack quality” your core product metric
+
+The product should not be judged only by search recall. It should be judged by whether an LLM coding agent can solve tasks with fewer tokens, fewer file reads, and fewer mistakes.
+
+Recent coding-agent evaluation work is moving in exactly this direction. SWE-bench evaluates whether agents can generate patches for real GitHub issues, while newer context-focused benchmarks measure whether agents retrieve the right files, symbols, and code regions before attempting a fix. SWE-bench defines the task as resolving real repository issues by generating patches, and ContextBench specifically introduces gold-context metrics such as context recall, precision, and efficiency for coding agents. ([GitHub][1])
+
+So define your own metrics:
+
+```text
+Context Recall:
+Did the pack include the files/functions needed to solve the task?
+
+Context Precision:
+How much of the pack was actually useful?
+
+Token Efficiency:
+How many tokens were spent before the agent had enough context?
+
+Patch Success:
+Did the agent produce a correct patch?
+
+Tool-Call Reduction:
+How many grep/read/search calls were avoided?
+
+Staleness Error Rate:
+Did the agent use outdated context after code changed?
+```
+
+Your product’s promise should be measurable as:
+
+```text
+Same or better patch quality,
+with fewer tokens,
+fewer file reads,
+and less repo wandering.
+```
+
+That is a much sharper value proposition than “semantic search over code.”
+
+---
+
+# 2. Upgrade from chunks to code units
+
+A lot of code RAG systems fail because they chunk like documents:
+
+```text
+every 800 tokens with overlap
+```
+
+That is usually bad for code.
+
+Your index should primarily be based on **semantic code units**:
+
+```text
+module
+class
+function
+method
+interface
+dataclass
+enum
+route
+test case
+fixture
+config block
+import group
+call site
+```
+
+Tree-sitter is well suited here because it can build concrete syntax trees and update them incrementally as files change. ([GitHub][2])
+
+For Python-first, each indexed unit should have metadata like:
+
+```json
+{
+  "symbol_id": "pkg.module.Class.method",
+  "file": "pkg/module.py",
+  "start_line": 42,
+  "end_line": 88,
+  "kind": "method",
+  "parent": "pkg.module.Class",
+  "imports": ["typing.Optional", "pkg.db.Session"],
+  "calls": ["validate_user", "save_record"],
+  "called_by": ["api.routes.create_user"],
+  "decorators": ["@router.post"],
+  "docstring": "...",
+  "signature": "def create_user(req: UserRequest) -> UserResponse",
+  "git_commit": "...",
+  "mtime": "...",
+  "content_hash": "..."
+}
+```
+
+This gives your search layer something much more powerful than plain text.
+
+The context pack should then be assembled from **symbols and relationships**, not arbitrary chunks.
+
+---
+
+# 3. Add relationship intelligence before adding more embeddings
+
+Embeddings are useful, but code agents often need exact structure:
+
+```text
+Where is this function defined?
+Who calls it?
+What tests cover it?
+What imports it?
+What config controls it?
+What exception type does it raise?
+```
+
+So I would prioritize a lightweight local code graph.
+
+For Python MVP, build these relationships:
+
+```text
+defines
+imports
+calls
+called_by
+inherits
+decorates
+references
+tested_by
+configured_by
+raises
+returns
+```
+
+You do not need a perfect compiler-grade graph at first. A “good enough” static graph gives huge benefits.
+
+Example context pack:
+
+```text
+TARGET SYMBOL
+billing.invoice.calculate_total
+
+DEFINITION
+app/billing/invoice.py:44-91
+
+CALLERS
+- app/api/invoices.py:create_invoice
+- app/jobs/monthly_billing.py:run
+
+TESTS
+- tests/billing/test_invoice.py:test_calculate_total_with_discount
+- tests/api/test_invoices.py:test_create_invoice
+
+RELATED CONFIG
+- config/pricing.yaml
+
+RISK
+Used by monthly billing job and invoice API.
+```
+
+This is dramatically more useful than:
+
+```text
+Top 8 vector matches for “invoice total bug”
+```
+
+There is already research momentum here. A recent Codebase-Memory paper describes a Tree-sitter-based knowledge graph exposed through MCP and reports large token savings compared with file-exploration agents, especially for graph-native queries such as caller ranking and hub detection. ([arXiv][3])
+
+That does not mean you should copy that architecture, but it validates the direction: **repository memory + graph + MCP** is a real emerging category.
+
+---
+
+# 4. Improve hybrid search with staged retrieval
+
+Your retrieval should not be one search. It should be a pipeline.
+
+A good local pipeline:
+
+```text
+1. Query understanding
+2. Candidate generation
+   - BM25 / keyword
+   - symbol search
+   - vector search
+   - file path search
+   - git history search later
+3. Fusion
+   - Reciprocal Rank Fusion or weighted merge
+4. Reranking
+   - local cross-encoder if available
+   - lightweight heuristic reranker otherwise
+5. Context expansion
+   - include parents, callees, callers, tests
+6. Token-budget packing
+7. Evidence-labeled output
+```
+
+Hybrid search is valuable because code queries need both exact lexical matching and semantic matching. Exact names like `ApprovalLimit`, `create_user`, `retry_count`, or `SAP_VENDOR_CODE` are often more important than semantic similarity. Modern hybrid search systems combine lexical/BM25, dense vectors, and reranking to improve relevance. ([qdrant.tech][4])
+
+For code, I would use different retrieval channels:
+
+```text
+Keyword channel:
+Exact identifiers, strings, error messages, file names.
+
+Symbol channel:
+Function/class/module definitions.
+
+Vector channel:
+Semantic behavior: “where do we validate purchase approvals?”
+
+Graph channel:
+Callers, callees, related tests, parent classes.
+
+Metadata channel:
+Recently changed, high churn, ownership, language, test/source split.
+```
+
+Then merge them.
+
+Do not let vector search dominate code retrieval. For coding agents, exact symbols and error traces are often king.
+
+---
+
+# 5. Make context packs task-aware
+
+A bug fix, feature request, refactor, and code review need different context.
+
+Your CLI/MCP should expose something like:
+
+```bash
+repoctx pack --task bugfix --query "..."
+repoctx pack --task feature --query "..."
+repoctx pack --task review --diff HEAD~1
+repoctx pack --task explain --symbol app.billing.Invoice
+repoctx pack --task test --symbol calculate_total
+```
+
+Each task type should use a different packing strategy.
+
+## Bugfix pack
+
+Should include:
+
+```text
+error trace / query
+most likely failing symbols
+definitions
+callers
+related tests
+recent changes
+config/env references
+known similar issues later
+```
+
+## Feature pack
+
+Should include:
+
+```text
+similar existing feature
+extension points
+interfaces/contracts
+data models
+routes/commands
+tests for similar behavior
+style conventions
+```
+
+## Refactor pack
+
+Should include:
+
+```text
+symbol definition
+all callers
+public API boundaries
+tests
+side effects
+inheritance/interface relationships
+```
+
+## Code review pack
+
+Should include:
+
+```text
+diff
+affected symbols
+callers/callees
+tests touched/not touched
+risk hotspots
+style/security rules
+```
+
+This turns your product from “search” into **context engineering infrastructure**.
+
+---
+
+# 6. Add a context-pack schema
+
+This is important. The LLM should receive a predictable, compact format every time.
+
+Example:
+
+````text
+# CONTEXT PACK
+
+## Task
+bugfix
+
+## Query
+"User deletion fails when account has no active subscription"
+
+## Repo Snapshot
+branch: feature/delete-user
+commit: abc123
+index_generated_at: 2026-06-22T...
+
+## High-Level Map
+Relevant area: app/users, app/billing, tests/users
+
+## Primary Symbols
+
+### S1 app.users.service.delete_user
+file: app/users/service.py
+lines: 42-98
+kind: function
+score: 0.92
+why: exact match for delete_user and caller of subscription cleanup
+
+```python
+...
+````
+
+### S2 app.billing.subscription.cancel_subscription
+
+file: app/billing/subscription.py
+lines: 120-171
+kind: function
+score: 0.84
+why: called by S1 and handles missing subscription state
+
+```python
+...
+```
+
+## Call Graph
+
+S1 delete_user
+calls S2 cancel_subscription
+calls app.audit.log_event
+
+## Related Tests
+
+T1 tests/users/test_delete_user.py::test_delete_user_without_subscription
+T2 tests/billing/test_subscription.py::test_cancel_missing_subscription
+
+## Risks
+
+* S1 is used by API and background cleanup job.
+* S2 raises SubscriptionNotFound in one branch.
+
+## Missing Context
+
+* No test found for inactive subscription + deleted user.
+
+## Suggested Next Actions
+
+1. Inspect S1 and S2.
+2. Add regression test T_missing_subscription.
+3. Patch exception handling in S1 or S2.
+
+````
+
+The pack should include **why each item is present**. That is crucial. Agents need relevance explanations, not just snippets.
+
+---
+
+# 7. Add “symbol cards” and “file cards”
+
+After indexing, generate compact summaries.
+
+Example symbol card:
+
+```json
+{
+  "symbol": "app.billing.invoice.calculate_total",
+  "kind": "function",
+  "purpose": "Calculates invoice total after discounts, tax, and rounding.",
+  "inputs": ["items", "discount_code", "tax_region"],
+  "outputs": "Money",
+  "side_effects": [],
+  "raises": ["InvalidDiscountCode"],
+  "calls": ["apply_discount", "calculate_tax"],
+  "called_by": ["create_invoice", "preview_invoice"],
+  "tests": ["test_calculate_total_*"],
+  "risk": "High: used in invoice creation and preview."
+}
+````
+
+A file card:
+
+```json
+{
+  "file": "app/billing/invoice.py",
+  "purpose": "Invoice domain logic.",
+  "main_symbols": ["Invoice", "calculate_total", "apply_discount"],
+  "external_dependencies": ["decimal", "app.tax"],
+  "related_tests": ["tests/billing/test_invoice.py"],
+  "change_frequency": "high",
+  "last_indexed_commit": "abc123"
+}
+```
+
+These cards are powerful because the agent can first consume the card, then request the full code only when necessary.
+
+This mirrors the “retrieve compressed experience, not raw traces” direction seen in context reuse research: correctly selected summarized experience can improve accuracy and reduce runtime/token cost, while unfiltered or wrong experience can hurt. ([arXiv][5])
+
+---
+
+# 8. Add version awareness earlier than “later phase”
+
+You mentioned git tracking as a later phase. I would pull a minimal version of it into the MVP.
+
+Not full change intelligence yet. Just this:
+
+```text
+index_commit
+working_tree_dirty
+file_content_hash
+symbol_content_hash
+last_indexed_at
+changed_since_index
+```
+
+Before returning a context pack, warn:
+
+```text
+WARNING:
+3 files in this pack changed since the last index.
+Run `repoctx index --changed` before using this context.
+```
+
+Or better:
+
+```bash
+repoctx index --changed
+```
+
+A stale index can be worse than no index. For coding agents, stale context causes confidently wrong patches.
+
+Minimum git-aware commands:
+
+```bash
+repoctx status
+repoctx index --changed
+repoctx pack --query "..." --require-fresh
+repoctx pack --diff HEAD~1
+```
+
+This becomes a major trust feature.
+
+---
+
+# 9. Add local evaluation harness
+
+You need a way to prove improvement.
+
+Create small repo tasks:
+
+```text
+Task:
+"Fix bug X"
+
+Gold context:
+- file A function f
+- file B function g
+- test C
+
+Expected patch:
+optional
+
+Metrics:
+- Did pack include gold files?
+- Did pack include gold symbols?
+- How many irrelevant tokens?
+- Did agent solve it?
+```
+
+Then compare:
+
+```text
+Baseline A: agent greps/reads freely
+Baseline B: vector search only
+Baseline C: BM25 only
+Your system: hybrid + graph + pack
+```
+
+Measure:
+
+```text
+context recall@token_budget
+precision@token_budget
+agent tool calls
+agent tokens
+patch success
+time to first useful edit
+```
+
+This aligns with ContextBench’s idea of tracking context recall, precision, and efficiency during issue resolution. ([arXiv][6])
+
+A simple local eval command would be valuable:
+
+```bash
+repoctx eval tasks.yaml
+```
+
+Example `tasks.yaml`:
+
+```yaml
+- id: bug_missing_subscription
+  query: "Fix user deletion when subscription is missing"
+  gold_symbols:
+    - app.users.service.delete_user
+    - app.billing.subscription.cancel_subscription
+  gold_tests:
+    - tests/users/test_delete_user.py
+  token_budget: 6000
+```
+
+This will help you improve ranking scientifically instead of by feel.
+
+---
+
+# 10. MCP: expose resources, tools, and prompts cleanly
+
+Your MCP implementation should not only expose `search`.
+
+Expose three types of capabilities.
+
+MCP uses a client-server architecture and includes concepts like tools, resources, prompts, and roots; roots define filesystem boundaries that servers can operate within. ([DeepWiki][7])
+
+For your system:
+
+## MCP tools
+
+```text
+repo.search(query, task_type, limit)
+repo.get_symbol(symbol_id)
+repo.get_file_card(path)
+repo.get_callers(symbol_id)
+repo.get_callees(symbol_id)
+repo.get_tests(symbol_id)
+repo.make_context_pack(query, task_type, token_budget)
+repo.status()
+repo.index_changed()
+```
+
+## MCP resources
+
+```text
+repo://symbols/app.billing.invoice.calculate_total
+repo://files/app/billing/invoice.py
+repo://cards/app/billing/invoice.py
+repo://packs/latest
+```
+
+## MCP prompts
+
+```text
+bugfix_with_context_pack
+code_review_with_context_pack
+explain_symbol
+generate_tests_for_symbol
+```
+
+The agent should not need to know your internal database. It should see clean capabilities.
+
+Important design principle:
+
+> MCP should expose **agent intentions**, not database internals.
+
+Bad:
+
+```text
+query_sqlite_table(...)
+```
+
+Good:
+
+```text
+make_context_pack(task_type="bugfix", query="...")
+```
+
+---
+
+# 11. Add “why this result?” explanations
+
+Every search result should include a retrieval explanation.
+
+Example:
+
+```json
+{
+  "symbol": "app.users.service.delete_user",
+  "score": 0.91,
+  "why": [
+    "Exact match: delete_user",
+    "Vector match: user deletion lifecycle",
+    "Caller of cancel_subscription",
+    "Related test contains query term: subscription"
+  ]
+}
+```
+
+This helps both the human and the LLM decide whether to trust the result.
+
+It also helps debugging your own ranking pipeline.
+
+---
+
+# 12. Add context expansion rules
+
+When a symbol is selected, automatically consider neighbors.
+
+For a function:
+
+```text
+include:
+- function definition
+- parent class
+- imports used inside function
+- directly called local functions
+- callers if task is refactor/bugfix
+- related tests
+- config/constants referenced
+```
+
+For a class:
+
+```text
+include:
+- class summary
+- constructor
+- public methods
+- inheritance chain
+- important fields
+- tests
+```
+
+For an API route:
+
+```text
+include:
+- route handler
+- request/response models
+- service function
+- auth/permission dependency
+- tests
+```
+
+For a failing test:
+
+```text
+include:
+- test
+- fixture
+- target function
+- assertion path
+- related factory/model
+```
+
+This is where your product becomes code-aware rather than search-aware.
+
+---
+
+# 13. Token-budgeted packing should be deliberate
+
+The packer is one of the most important components.
+
+I would implement packing tiers:
+
+```text
+Tier 1: summaries/cards only
+Tier 2: signatures + docstrings + key lines
+Tier 3: full symbol bodies
+Tier 4: full files only when absolutely necessary
+```
+
+Example algorithm:
+
+```text
+Given token budget B:
+
+1. Reserve 10% for task, instructions, and output schema.
+2. Reserve 15% for repo map and relationship graph.
+3. Allocate 50% to primary symbols.
+4. Allocate 15% to tests.
+5. Allocate 10% to risks/missing context.
+```
+
+For each candidate, select representation:
+
+```text
+high score + small function → full body
+high score + large file → symbol body only
+medium score → card/signature only
+low score but graph-important → one-line summary
+```
+
+The LLM does not always need full code. Often it first needs a map.
+
+---
+
+# 14. Add “missing context” detection
+
+A great context system does not pretend it found everything.
+
+It should say:
+
+```text
+Missing / weak context:
+- No tests found for this symbol.
+- Could not resolve dynamic import.
+- Function is called through reflection/string route.
+- Vector search found semantic match, but no symbol-level exact match.
+- Index is stale for 2 files.
+```
+
+This is extremely valuable for agents because it prevents overconfidence.
+
+---
+
+# 15. Add Python-specific intelligence
+
+Since your MVP is Python-first, lean into Python-specific wins.
+
+Index:
+
+```text
+pyproject.toml
+requirements.txt
+setup.cfg
+ruff/mypy/pytest config
+pytest fixtures
+FastAPI/Flask/Django routes
+Pydantic models
+SQLAlchemy models
+Celery tasks
+Click/Typer commands
+environment variables
+logging setup
+exception classes
+```
+
+Detect framework patterns:
+
+```text
+FastAPI:
+- route decorators
+- dependency injection
+- request/response models
+
+Django:
+- models
+- views
+- serializers
+- urls
+- migrations
+
+Pytest:
+- fixtures
+- parametrized tests
+- monkeypatch usage
+
+SQLAlchemy:
+- models
+- relationships
+- session usage
+```
+
+A generic code search tool will not do this well. This can be your differentiation.
+
+---
+
+# 16. Add “test intelligence” early
+
+For coding agents, tests are often the highest-value context.
+
+Index tests as first-class units:
+
+```text
+test function
+fixtures used
+target symbols tested
+assertions
+parametrize cases
+mocked dependencies
+```
+
+Then expose:
+
+```bash
+repoctx tests-for app.billing.invoice.calculate_total
+repoctx pack --task bugfix --include-tests
+```
+
+A bugfix context pack without related tests is incomplete.
+
+---
+
+# 17. Add “patch context” mode
+
+For code review or agent repair, support:
+
+```bash
+repoctx pack --diff
+repoctx pack --diff HEAD~1
+repoctx pack --changed
+```
+
+It should output:
+
+```text
+changed symbols
+affected callers
+affected tests
+risk areas
+public API changes
+missing tests
+```
+
+This will be very useful in real workflows.
+
+---
+
+# 18. Product positioning: avoid “local RAG”
+
+I would not market it as local RAG. Position it as:
+
+> **Local codebase memory and context compiler for coding agents.**
+
+Better names for the category:
+
+```text
+context compiler
+repo memory layer
+agent context engine
+local code intelligence layer
+codebase memory server
+```
+
+The phrase “context compiler” is especially strong because your tool compiles messy repo state into an optimized prompt/context artifact.
+
+---
+
+# 19. Suggested next implementation priorities
+
+Given your current MVP vertical slice, I would prioritize in this order:
+
+## Priority 1 — Context pack schema
+
+Make the pack format stable, compact, and evidence-labeled.
+
+Deliverable:
+
+```bash
+repoctx pack "query" --task bugfix --budget 6000
+```
+
+Output:
+
+```text
+task
+repo snapshot
+primary symbols
+related tests
+call graph
+risks
+missing context
+suggested next actions
+```
+
+## Priority 2 — Symbol graph
+
+Add local symbol relationships:
+
+```text
+defines
+imports
+calls
+called_by
+tested_by
+```
+
+Even imperfect graph data will help.
+
+## Priority 3 — Freshness / git status
+
+Add:
+
+```bash
+repoctx status
+repoctx index --changed
+repoctx pack --require-fresh
+```
+
+## Priority 4 — Test intelligence
+
+Make tests first-class searchable/indexed objects.
+
+## Priority 5 — MCP agent tools
+
+Expose high-level tools:
+
+```text
+make_context_pack
+get_symbol
+get_tests
+get_callers
+get_file_card
+status
+```
+
+## Priority 6 — Eval harness
+
+Create a mini benchmark over 10–30 tasks from real repos.
+
+---
+
+# 20. One architecture I would aim for
+
+```text
+                 ┌────────────────────┐
+                 │      Repository     │
+                 └─────────┬──────────┘
+                           │
+                           ▼
+┌────────────────────────────────────────────────┐
+│                  Indexer                       │
+│  tree-sitter / AST / files / tests / configs   │
+└───────┬─────────────┬─────────────┬───────────┘
+        │             │             │
+        ▼             ▼             ▼
+┌────────────┐ ┌────────────┐ ┌───────────────┐
+│ Symbol DB  │ │ Text Index │ │ Vector Index  │
+│ SQLite     │ │ BM25/FTS5  │ │ local embeds  │
+└─────┬──────┘ └─────┬──────┘ └──────┬────────┘
+      │              │               │
+      └──────────────┼───────────────┘
+                     ▼
+          ┌─────────────────────┐
+          │ Hybrid Retriever     │
+          │ lexical+vector+graph │
+          └──────────┬──────────┘
+                     ▼
+          ┌─────────────────────┐
+          │ Reranker / Expander  │
+          │ callers/tests/config │
+          └──────────┬──────────┘
+                     ▼
+          ┌─────────────────────┐
+          │ Context Pack Builder │
+          │ token budget + schema│
+          └──────────┬──────────┘
+                     ▼
+        ┌────────────┴────────────┐
+        ▼                         ▼
+┌──────────────┐          ┌──────────────┐
+│ CLI          │          │ MCP Server   │
+└──────────────┘          └──────────────┘
+```
+
+---
+
+# 21. The biggest risk
+
+The biggest risk is building a beautiful search system that still gives the agent **too much loosely related context**.
+
+The win condition is not:
+
+```text
+Can I find relevant code?
+```
+
+The win condition is:
+
+```text
+Can I provide the smallest sufficient context pack for a specific coding task?
+```
+
+That means your core object should not be the search result.
+
+Your core object should be:
+
+```text
+ContextPack
+```
+
+with:
+
+```text
+evidence
+relationships
+freshness
+risk
+missing context
+token budget
+task type
+```
+
+---
+
+# 22. My strongest recommendation
+
+Build a **Context Pack Quality Loop** immediately.
+
+For every query, store:
+
+```text
+query
+generated pack
+agent outcome
+files actually edited
+files/tests actually used
+whether patch passed
+human rating
+```
+
+Then use this to improve ranking.
+
+Later, this becomes your “change intelligence” and “experience memory” layer.
+
+Example:
+
+```json
+{
+  "query": "fix invoice rounding bug",
+  "pack_symbols": ["calculate_total", "round_money", "Invoice"],
+  "edited_symbols": ["round_money"],
+  "tests_failed_initially": ["test_invoice_rounding"],
+  "tests_passed_after": true,
+  "human_rating": 4,
+  "missed_context": ["CurrencyPrecisionConfig"]
+}
+```
+
+This is how your tool gets smarter over time without needing cloud training.
+
+---
+
+## Bottom line
+
+To improve it, I would evolve it from:
+
+```text
+local hybrid code search
+```
+
+into:
+
+```text
+local, version-aware context compiler for coding agents
+```
+
+The most valuable next features are:
+
+```text
+1. Stable context pack schema
+2. Symbol-level indexing
+3. Lightweight code graph
+4. Task-aware pack building
+5. Test intelligence
+6. Freshness/git tracking
+7. MCP tools around agent intentions
+8. Evaluation harness with context recall/precision/token metrics
+```
+
+That would make the project genuinely useful and differentiated. Your thesis is right: **do not make the agent explore the repo blindly; compile the repo into compact, searchable, version-aware working memory before the agent arrives.**
+
+[1]: https://github.com/swe-bench/SWE-bench?utm_source=chatgpt.com "GitHub - SWE-bench/SWE-bench: SWE-bench: Can Language Models Resolve ..."
+[2]: https://github.com/tree-sitter/tree-sitter?utm_source=chatgpt.com "GitHub - tree-sitter/tree-sitter: An incremental parsing system for ..."
+[3]: https://arxiv.org/abs/2603.27277?utm_source=chatgpt.com "Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP"
+[4]: https://qdrant.tech/documentation/tutorials-basics/reranking-hybrid-search/?utm_source=chatgpt.com "Hybrid Search with Reranking - Qdrant"
+[5]: https://arxiv.org/abs/2602.08316?utm_source=chatgpt.com "SWE Context Bench: A Benchmark for Context Learning in Coding"
+[6]: https://arxiv.org/abs/2602.05892?utm_source=chatgpt.com "ContextBench: A Benchmark for Context Retrieval in Coding Agents"
+[7]: https://deepwiki.com/modelcontextprotocol/servers/1.1-mcp-protocol-and-architecture?utm_source=chatgpt.com "MCP Protocol and Architecture | modelcontextprotocol/servers | DeepWiki"

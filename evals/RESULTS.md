@@ -380,3 +380,66 @@ to the `.cpp`'s own content hash, which did not change. This differs from #1/#5 
 activate): it is an ongoing silent gap. Closing it (a header→cpp dependency reindex) is scope
 the roadmap demotes; for now, a full reindex re-merges. A header→cpp edit on the SAME `.cpp`
 is fine — the `.cpp` is reindexed and re-reads the current header.
+
+---
+
+## #9 — Channel-isolation baselines + external task sets (2026-06-22)
+
+**The gap this closes.** The harness compared the tool to its OWN prior snapshot (`--gate`)
+and across scopes/models (`--sweep`/bake-off), but **never to single-channel retrievers** —
+the "0/4 retrieval baselines" gap. So we could say "we didn't regress" but not "hybrid earns
+its complexity over plain vector / plain BM25 / plain symbol."
+
+**What shipped.**
+- **`run_eval.py --baselines`**: runs the gold set under **hybrid vs symbol-only vs
+  keyword-only(BM25) vs vector-only**. Isolation is a new additive `channels_only` arg on
+  `Retriever.search`/`search_assessed`/`_base_search` (`hybrid_search.py`) — it runs ONLY the
+  named channels, so the merge ranks by that channel alone (absent channels contribute 0; the
+  `_normalize`/`_identity` maps are monotonic → faithful single-channel ranking, **not**
+  weight-zeroing). Symbol-only / keyword-only never touch `self.lance`/`self.embedder`, so
+  they pay no model load. It bypasses the exact-symbol short-circuit and the fan-out (both are
+  hybrid behaviours). `None` (every existing caller) = byte-identical to before.
+- **`run_eval.py --tasks <PATH>`** + **`evals/tasks.example.json`**: load an external task set
+  (JSON; YAML if PyYAML present) so `run`/`--baselines` can target **ANY indexed repo**, not
+  just this one — the repo-agnostic, large-repo / cross-file task set (Improvements3 #9's
+  `tasks.yaml`, made real). Schema: `queries`=[{q, files, symbols}] + optional `impact`.
+
+**Non-regressive (proven, not asserted).** The change is additive (`channels_only=None`
+default). `--perquery` is **byte-identical** before/after the edit (the real determinism check
+— the `--gate` only sees aggregates), and the full offline suite is **162 passed**. The new
+modes never touch `run()`'s summary, so the `--gate` baseline is unmoved by this work.
+
+**First finding (built-in gold, n=15, current index).** RETRIEVAL RANKING only:
+
+| arm | P@1 | P@3 | P@5 | symP5 | MRR | paired vs hybrid |
+|---|---|---|---|---|---|---|
+| hybrid | 0.400 | 0.467 | 0.600 | 0.333 | 0.472 | — |
+| symbol-only | 0.133 | 0.467 | 0.467 | 0.267 | 0.296 | 3 better / 6 worse |
+| keyword(BM25) | 0.000 | 0.267 | 0.267 | 0.200 | 0.132 | 1 better / 10 worse |
+| **vector-only** | **0.467** | **0.667** | **0.733** | **0.400** | **0.593** | **7 better / 1 worse** |
+
+- **vector-only BEATS hybrid** here (P@5 .733 vs .600; 7/1 paired). Consistent with the
+  `--modes` result that the vector-heavy `discovery` preset {vec .50} beats the default — the
+  keyword/symbol channels are *dragging* the blend down on this gold. **Honest read:** the
+  gold is **100% discovery-shaped**, so this argues the **default weighting under-weights
+  vector for discovery queries** (a tuning signal), NOT that hybrid is globally worse — the
+  exact-symbol/error-token regimes where symbol/keyword earn their weight are not in this
+  gold. The cross-type / large-repo crossover is what would settle it (the #11 matrix).
+
+**Scope of the claim (the half this does NOT close).** `--baselines` measures **retrieval
+ranking**. It does **NOT** measure the **token/cost-at-scale** win — that win is **agent-level**
+(`evals/ab_runner.py`: cost/tokens/tool-calls solving seeded bugs, where the protocol's edge
+showed up on cross-file location in large repos). Measuring it at scale needs **large-repo
+seeded-bug AB tasks**, and `ab_runner` currently hardwires a pristine copy of THIS repo +
+`pytest` grading + `*.py` mutations — so an external large repo needs a **configurable test
+command + language-agnostic diff/mutation**: a separate build, named here, not yet done.
+
+**Note on the `--gate` state (2026-06-22).** The gate FAILs vs `roadmap_v2_baseline` (P@3
+0.667→0.467, mrr 0.584→0.472, resolution 0.733→0.333; impact_fp 0→0.273, wrong_symbol
+0→0.667). This is **dogfood drift, not this change**: HEAD diverged from the 2026-06-20
+baseline (the Dart/HTML/CSS extraction commits), an incremental reindex (13 changed / 117
+unchanged) does not recover it, and the FAIL reproduces **identically before this edit**
+(`--perquery` proof + the impact/same-name metrics come from `graph.py`/`IMPACT_GOLD`, which
+this change never touches). Restoring green needs a deliberate, user-authorized re-baseline
+(`--save roadmap_v2_baseline` after a full reindex + re-derived `IMPACT_GOLD`) — out of scope
+for #9 and tracked as the documented "same-corpus only" discipline.

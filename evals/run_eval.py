@@ -38,11 +38,12 @@ def _bare(qname) -> str:
     return (qname or "").split(".")[-1]
 
 
-def _impact_fp_fn(settings) -> dict:
-    """Compare repo_impact's direct callers to hand-authored truth (gold.IMPACT_GOLD).
-    FP = claimed-but-not-real; FN = real-but-missed."""
+def _impact_fp_fn(settings, impact_gold=None) -> dict:
+    """Compare repo_impact's direct callers to hand-authored truth (gold.IMPACT_GOLD, or an
+    external task file's `impact` list). FP = claimed-but-not-real; FN = real-but-missed."""
+    impact_gold = IMPACT_GOLD if impact_gold is None else impact_gold
     fp = fn = pred = gold = 0
-    for item in IMPACT_GOLD:
+    for item in impact_gold:
         imp = service.impact_for(settings, item["ref"]) or {}
         got = set(imp.get("direct", []))
         want = set(item["true_direct"])
@@ -52,7 +53,7 @@ def _impact_fp_fn(settings) -> dict:
         gold += len(want)
     return {"impact_fp_rate": round(fp / max(pred, 1), 3),
             "impact_fn_rate": round(fn / max(gold, 1), 3),
-            "impact_cases": len(IMPACT_GOLD)}
+            "impact_cases": len(impact_gold)}
 
 
 def _first_rank(results, needles, attr):
@@ -73,13 +74,43 @@ def _card_line(r) -> str:
     return f"- {r.path}::{sym} (L{r.start_line}-{r.end_line}) — {r.summary or ''}"
 
 
-def run(repo: str = ".") -> dict:
+def load_tasks(path: str):
+    """Load an EXTERNAL retrieval task set so the harness can run against ANY indexed repo —
+    the large-repo / cross-file task set (Improvements3 #9's `tasks.yaml`, made real and
+    repo-agnostic). Returns (queries, impact).
+
+    JSON by default; YAML when the path ends .yaml/.yml AND PyYAML is installed (no hard dep).
+    Schema: a top-level LIST of query items, OR a dict with `queries` (required) + optional
+    `impact`. Each query: {q, files:[POSIX path substrings], symbols?:[bare names]}. Each
+    impact: {ref: "path::Qualified.Name", true_direct:[refs]}. Extra keys (e.g. `_doc`) are
+    ignored, so a template can document itself inline."""
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    if p.suffix.lower() in (".yaml", ".yml"):
+        import yaml  # optional — only imported for YAML task files
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+    if isinstance(data, list):
+        queries, impact = data, []
+    else:
+        queries, impact = data.get("queries", []), data.get("impact", [])
+    if not queries:
+        raise SystemExit(f"no queries in task file: {path}")
+    for i, item in enumerate(queries):
+        if "q" not in item or "files" not in item:
+            raise SystemExit(f"task[{i}] needs at least 'q' and 'files': {item!r}")
+    return queries, impact
+
+
+def run(repo: str = ".", gold=None, impact_gold=None) -> dict:
+    gold = gold or GOLD
     settings = Settings.load(repo)
     retriever = Retriever(settings)
     packer = ContextPacker(settings, retriever=retriever)
     counter = TokenCounter(settings.section("context_pack").get("tokenizer", "cl100k_base"))
 
-    n = len(GOLD)
+    n = len(gold)
     file_hits = {1: 0, 3: 0, 5: 0}
     sym_hit5 = 0
     mrr_sum = 0.0
@@ -97,7 +128,7 @@ def run(repo: str = ".") -> dict:
     wrong_symbol = 0
     rows = []
 
-    for item in GOLD:
+    for item in gold:
         q = item["q"]
         results = retriever.search(q, top_k=TOP_K)
         f_rank = _first_rank(results, item["files"], "path")
@@ -194,7 +225,7 @@ def run(repo: str = ".") -> dict:
                                         if same_name_cases else 0.0),
         "same_name_cases": same_name_cases,
     }
-    summary.update(_impact_fp_fn(settings))
+    summary.update(_impact_fp_fn(settings, impact_gold))
     return {"summary": summary, "rows": rows}
 
 
@@ -591,12 +622,87 @@ def modes_eval(repo: str = ".") -> dict:
     return out
 
 
-def perquery(repo: str = ".") -> None:
-    """Per-query rank + top-1 ref — for diffing two index states (e.g. heuristic vs
-    enriched) to see exactly which query moved."""
+# ---------------------------------------------------------------------------
+# Channel-isolation baselines (#9 — "is hybrid earning its complexity?").
+#
+# The 0/4 retrieval-baseline gap: the harness compared the tool to its own prior snapshot,
+# never to single-channel retrievers. This runs the gold set under hybrid vs symbol-only vs
+# keyword-only(BM25) vs vector-only (Retriever.search(..., channels_only=...)) — a faithful
+# single-channel ranking, not weight-zeroing. SCOPE OF THE CLAIM (honest): this measures
+# RETRIEVAL RANKING only. It does NOT measure the token/cost-at-scale win — that is
+# AGENT-level (evals/ab_runner.py: cost/tokens/tool-calls solving seeded bugs) and needs
+# LARGE-REPO seeded-bug tasks, the explicit remaining half (see RESULTS.md "#9"). On a
+# discovery-shaped gold a vector-heavy arm may match or beat hybrid (cf. the `discovery`
+# preset in --modes) — that is a FINDING consistent with prior evidence, not a harness bug.
+# ---------------------------------------------------------------------------
+_ARMS = [("hybrid", None), ("symbol-only", {"symbol"}),
+         ("keyword(BM25)", {"keyword"}), ("vector-only", {"vector"})]
+
+
+def _rank_metrics(retriever, gold, search_fn) -> dict:
+    n = len(gold)
+    fh = {1: 0, 3: 0, 5: 0}
+    sym5 = 0
+    mrr = 0.0
+    ranks = []
+    for item in gold:
+        res = search_fn(item["q"])
+        f = _first_rank(res, item["files"], "path")
+        s = _first_rank(res, item.get("symbols", []), "symbol_name")
+        ranks.append(f)
+        for k in (1, 3, 5):
+            if f is not None and f < k:
+                fh[k] += 1
+        if s is not None and s < 5:
+            sym5 += 1
+        mrr += (1.0 / (f + 1)) if f is not None else 0.0
+    return {"p1": fh[1] / n, "p3": fh[3] / n, "p5": fh[5] / n, "symP5": sym5 / n,
+            "mrr": mrr / n, "misses": sum(1 for r in ranks if r is None), "ranks": ranks}
+
+
+def baselines(repo: str = ".", gold=None) -> dict:
+    gold = gold or GOLD
     settings = Settings.load(repo)
     retriever = Retriever(settings)
-    for i, item in enumerate(GOLD):
+    metrics = {
+        name: _rank_metrics(retriever, gold,
+                            lambda q, only=only: retriever.search(q, top_k=10,
+                                                                  channels_only=only))
+        for name, only in _ARMS
+    }
+    retriever.close()
+
+    print("=== Channel-isolation baselines (RETRIEVAL RANKING — does hybrid earn it?) ===")
+    print(f"  n={len(gold)} queries")
+    print(f"  {'arm':14s} {'P@1':>6} {'P@3':>6} {'P@5':>6} {'symP5':>6} {'MRR':>6} {'miss':>5}")
+    for name, _ in _ARMS:
+        m = metrics[name]
+        print(f"  {name:14s} {m['p1']:6.3f} {m['p3']:6.3f} {m['p5']:6.3f} "
+              f"{m['symP5']:6.3f} {m['mrr']:6.3f} {m['misses']:5d}")
+    base = metrics["hybrid"]["ranks"]
+    print(f"\n  paired vs hybrid (n={len(gold)}):")
+    for name, _ in _ARMS[1:]:
+        imp = wor = 0
+        for b, o in zip(base, metrics[name]["ranks"]):
+            bb = 99 if b is None else b
+            oo = 99 if o is None else o
+            imp += oo < bb
+            wor += oo > bb
+        print(f"    {name:14s} better {imp}  worse {wor}")
+    print("\n  READ: RETRIEVAL-RANKING ONLY — 'is hybrid worth its complexity over a single "
+          "channel here'. It does NOT measure the token/cost-at-scale win (agent-level, "
+          "ab_runner.py; needs large-repo seeded-bug tasks — the named remaining half). A "
+          "vector-heavy arm matching hybrid on this discovery gold is a finding, not a bug.")
+    return metrics
+
+
+def perquery(repo: str = ".", gold=None) -> None:
+    """Per-query rank + top-1 ref — for diffing two index states (e.g. heuristic vs
+    enriched) to see exactly which query moved."""
+    gold = gold or GOLD
+    settings = Settings.load(repo)
+    retriever = Retriever(settings)
+    for i, item in enumerate(gold):
         res = retriever.search(item["q"], top_k=10)
         rank = _first_rank(res, item["files"], "path")
         top1 = res[0].ref if res else "-"
@@ -617,14 +723,26 @@ if __name__ == "__main__":
                     help="C++ fixture: lock Step-8 header->cpp doc merge lifting the def (real model)")
     ap.add_argument("--modes", action="store_true",
                     help="Step-6 context modes: default-sensitivity report (NOT validation)")
+    ap.add_argument("--baselines", action="store_true",
+                    help="#9 channel-isolation baselines: hybrid vs symbol/keyword/vector-only "
+                         "(RETRIEVAL ranking only — not the token-at-scale win)")
+    ap.add_argument("--tasks", default=None,
+                    help="path to an external task set (JSON/YAML) for run/baselines against "
+                         "ANY indexed repo; pair with --repo (the large-repo / cross-file set)")
     ap.add_argument("--perquery", action="store_true", help="per-query rank + top1 ref")
     ap.add_argument("--gate", default=None,
                     help="label -> compare to evals/<label>.json; exit 1 if a hard "
                          "metric regressed (M1 lock + M3 acceptance gate)")
     args = ap.parse_args()
 
+    gold = impact_gold = None
+    if args.tasks:
+        gold, impact_gold = load_tasks(args.tasks)
+
     if args.perquery:
-        perquery(args.repo)
+        perquery(args.repo, gold=gold)
+    elif args.baselines:
+        baselines(args.repo, gold=gold)
     elif args.brief:
         brief_eval(args.repo)
     elif args.cpp:
@@ -638,7 +756,7 @@ if __name__ == "__main__":
     elif args.sweep:
         sweep(args.repo)
     else:
-        result = run(args.repo)
+        result = run(args.repo, gold=gold, impact_gold=impact_gold)
         _print(result)
         if args.save:
             out = Path(__file__).parent / f"{args.save}.json"
