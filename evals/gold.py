@@ -65,24 +65,64 @@ CPP_MERGE_GOLD = [
      "target": "World::queueDeath"},
 ]
 
-# Impact gold: the TRUE direct callers of a symbol, hand-authored from an exhaustive
-# grep of the source (independent of repo_impact's own output, so impact FP/FN is a real
-# comparison, not circular). Refs are `path::qualified_name`.
+# Impact / edge gold: the TRUE direct callers of a symbol, hand-authored from an exhaustive
+# grep of the source (independent of repo_impact's own output, so the FP/FN + precision/recall
+# numbers are a real comparison, not circular). Refs are `path::qualified_name`.
+#
+# This is the relation/edge eval set (Improvements5 "relation evals" / ROADMAP Step 1 #11):
+# it measures the CALLER (edit-impact) edge — the one that answers "what breaks if I change
+# this" and "did the tool find the right edit site." Targets are chosen with UNIQUE names so
+# cross-file bare calls resolve via the unique-name fallback (conf 0.6 == CALLER_MIN_CONFIDENCE,
+# so they count as confident, not "possible") — i.e. the tool is expected to find ALL real
+# callers, and any FP/FN is a real signal, not an artefact of name collision.
+#
+# Re-derived 2026-06-23 against the current tree (commit 3a306f9). Each entry's `true_direct`
+# is the set of FUNCTIONS/METHODS that contain a call to the target, mapped from a fresh
+# `grep '<name>('` across pandemonium/ + tests/ to its enclosing symbol. Module-level script
+# call sites (e.g. _probe_stem.py) are excluded — callers are symbols, not loose statements.
 IMPACT_GOLD = [
     {"ref": "pandemonium/graph.py::GraphIndex.resolve_call",
      "true_direct": ["pandemonium/graph.py::_callees_of",
                      "pandemonium/graph.py::_callers_of"]},
-    # Re-derived 2026-06-20 from an exhaustive grep of `is_test_path(` across pandemonium/
-    # AND tests/ (the gold is independent of the tool). The earlier 3-entry list was stale:
-    # it omitted the pre-existing graph._split_prod_test caller, find_tests, and the
-    # test_graph unit test, and predates brief._partition_tests. All six below are real
-    # call sites; repo_impact returns exactly these, so impact_fp/fn stay 0 by truth, not
-    # by matching the tool.
+    {"ref": "pandemonium/graph.py::_callers_of",
+     "true_direct": ["pandemonium/graph.py::repo_graph",
+                     "pandemonium/graph.py::repo_impact"]},
+    {"ref": "pandemonium/graph.py::_callees_of",
+     "true_direct": ["pandemonium/brief.py::_call_flow",
+                     "pandemonium/graph.py::repo_graph",
+                     "pandemonium/graph.py::repo_logic_map",
+                     "pandemonium/viz.py::build_graph_data"]},
+    {"ref": "pandemonium/graph.py::_edges_available",
+     "true_direct": ["pandemonium/graph.py::repo_graph",
+                     "pandemonium/graph.py::repo_impact"]},
+    {"ref": "pandemonium/graph.py::_affects_evidence_hash",
+     "true_direct": ["pandemonium/graph.py::ingest_affects",
+                     "pandemonium/graph.py::repo_graph"]},
+    {"ref": "pandemonium/graph.py::_split_ambiguous_callees",
+     "true_direct": ["pandemonium/graph.py::repo_graph"]},
+    {"ref": "pandemonium/graph.py::_split_prod_test",
+     "true_direct": ["pandemonium/graph.py::repo_impact",
+                     "pandemonium/brief.py::_verified_block"]},
+    {"ref": "pandemonium/graph.py::_resolve_target",
+     "true_direct": ["pandemonium/brief.py::_call_flow",
+                     "pandemonium/graph.py::repo_graph",
+                     "pandemonium/graph.py::repo_impact",
+                     "pandemonium/graph.py::repo_logic_map"]},
+    {"ref": "pandemonium/graph.py::_plan_tests",
+     "true_direct": ["pandemonium/graph.py::edit_plan"]},
+    # Cross-file recall case + nested-function attribution. Re-derived 2026-06-23: the
+    # 2026-06-20 list omitted the viz callers (added with the viz work). In viz.py the three
+    # is_test_path calls live in NESTED helpers inside build_graph_data (ensure_dir_chain @127,
+    # ensure_file @142, ensure_symbol @166 — verified by reading viz.py), so the caller refs
+    # are the nested-qualified names, NOT the outer build_graph_data.
     {"ref": "pandemonium/retrieval/tests_finder.py::is_test_path",
      "true_direct": ["pandemonium/retrieval/tests_finder.py::find_tests",
                      "pandemonium/graph.py::_plan_tests",
                      "pandemonium/graph.py::_split_prod_test",
                      "pandemonium/mapping.py::_build_tests",
                      "pandemonium/brief.py::_partition_tests",
+                     "pandemonium/viz.py::build_graph_data.ensure_dir_chain",
+                     "pandemonium/viz.py::build_graph_data.ensure_file",
+                     "pandemonium/viz.py::build_graph_data.ensure_symbol",
                      "tests/test_graph.py::test_is_test_path_uses_word_boundaries_not_substring"]},
 ]

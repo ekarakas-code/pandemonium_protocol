@@ -109,6 +109,39 @@ def test_m1_python_module_qualified_and_self_callers_resolve(tmp_path):
     assert any("Engine.go" in r for r in helper_callers), "Python self.method() caller dropped"
 
 
+# --- Python: nested-function (closure) caller attribution --------------------
+def test_m1_python_nested_function_caller_attributes_to_inner(tmp_path):
+    """A call inside a NESTED function attributes to the nested-qualified caller
+    (`outer.inner`), NOT the outer function — the exact subtlety the edge-eval gold hit
+    with `viz.build_graph_data.ensure_file`. Misattributing to the outer (or dropping it)
+    would silently corrupt impact for any closure-heavy code."""
+    settings = _index(tmp_path, {"n.py": (
+        "def helper():\n    return 1\n\n"
+        "def outer():\n"
+        "    def inner():\n"
+        "        return helper()\n"
+        "    return inner\n")})
+    callers = _direct_callers(settings, _ref(settings, "helper", "n.py"))
+    assert any(r.endswith("::outer.inner") for r in callers), \
+        "nested-function call should attribute to outer.inner"
+    assert not any(r.endswith("::outer") for r in callers), \
+        "nested-function call wrongly attributed to the OUTER function"
+
+
+# --- Python: cross-file bare call via the unique-name fallback ----------------
+def test_m1_python_cross_file_bare_call_caller_resolves(tmp_path):
+    """A bare call to a UNIQUELY-named function imported from another module resolves the
+    cross-file caller (unique-name fallback at CALLER_MIN_CONFIDENCE, so it counts as
+    confident — not merely "possible"). This is the recall mechanism the edge-eval relies
+    on for cross-file callers like `brief._verified_block` -> `graph._split_prod_test`."""
+    settings = _index(tmp_path, {
+        "lib.py": "def uniquelyNamedHelper():\n    return 1\n",
+        "app.py": ("from lib import uniquelyNamedHelper\n\n"
+                   "def run():\n    return uniquelyNamedHelper()\n")})
+    callers = _direct_callers(settings, _ref(settings, "uniquelyNamedHelper", "lib.py"))
+    assert any("app.py::run" in r for r in callers), "cross-file bare-call caller dropped"
+
+
 # --- The cross-language non-resolution guarantee -----------------------------
 def test_m1_callers_never_cross_languages(tmp_path):
     """A C++ caller must never be attributed to a same-named Python target (and vice

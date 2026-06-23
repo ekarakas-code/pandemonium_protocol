@@ -40,20 +40,47 @@ def _bare(qname) -> str:
 
 def _impact_fp_fn(settings, impact_gold=None) -> dict:
     """Compare repo_impact's direct callers to hand-authored truth (gold.IMPACT_GOLD, or an
-    external task file's `impact` list). FP = claimed-but-not-real; FN = real-but-missed."""
+    external task file's `impact` list). FP = claimed-but-not-real; FN = real-but-missed.
+
+    Also reports the conventional CALLER-edge precision/recall (Improvements5 "relation
+    evals" — micro-averaged over all gold callers) and the per-symbol EXACT-match rate: the
+    fraction of gold symbols for which the tool returned ALL and ONLY the real callers. That
+    last one is the "did the tool find the correct edit site" signal — stricter than the
+    micro rates, since one wrong/missed caller fails the whole symbol."""
     impact_gold = IMPACT_GOLD if impact_gold is None else impact_gold
-    fp = fn = pred = gold = 0
+    fp = fn = pred = gold = tp = exact = 0
     for item in impact_gold:
         imp = service.impact_for(settings, item["ref"]) or {}
         got = set(imp.get("direct", []))
         want = set(item["true_direct"])
+        tp += len(got & want)
         fp += len(got - want)
         fn += len(want - got)
         pred += len(got)
         gold += len(want)
+        exact += int(got == want)
+    n = max(len(impact_gold), 1)
     return {"impact_fp_rate": round(fp / max(pred, 1), 3),
             "impact_fn_rate": round(fn / max(gold, 1), 3),
+            "edge_precision": round(tp / max(pred, 1), 3),
+            "edge_recall": round(tp / max(gold, 1), 3),
+            "impact_exact_case_rate": round(exact / n, 3),
             "impact_cases": len(impact_gold)}
+
+
+def _impact_per_case(settings, impact_gold=None) -> list:
+    """Per-symbol caller-edge detail for --perquery: what the tool got vs the gold truth,
+    plus the missing (FN) and extra (FP) refs. The diffing tool for adjudicating whether a
+    non-zero FP/FN is a real tool limitation or a stale gold entry."""
+    impact_gold = IMPACT_GOLD if impact_gold is None else impact_gold
+    rows = []
+    for item in impact_gold:
+        imp = service.impact_for(settings, item["ref"]) or {}
+        got = set(imp.get("direct", []))
+        want = set(item["true_direct"])
+        rows.append({"ref": item["ref"], "exact": got == want,
+                     "missing": sorted(want - got), "extra": sorted(got - want)})
+    return rows
 
 
 def _first_rank(results, needles, attr):
@@ -237,7 +264,8 @@ def _print(result: dict) -> None:
                 "token_savings_cards_vs_pack", "same_path_repeat_rate",
                 "duplicate_card_rate", "fetches_to_resolution", "resolution_rate",
                 "ambiguous_ref_rate", "wrong_symbol_same_name_rate", "same_name_cases",
-                "impact_fp_rate", "impact_fn_rate", "impact_cases"):
+                "impact_fp_rate", "impact_fn_rate", "edge_precision", "edge_recall",
+                "impact_exact_case_rate", "impact_cases"):
         print(f"  {key:30s} {s[key]}")
     misses = [r["q"] for r in result["rows"] if r["file_rank"] is None]
     if misses:
@@ -263,6 +291,9 @@ _EPS = 1e-9
 _GATE_SPEC = [
     ("impact_fp_rate", "down", True),
     ("impact_fn_rate", "down", True),
+    ("edge_precision", "up", True),          # caller-edge precision (1 - fp_rate)
+    ("edge_recall", "up", True),             # caller-edge recall (1 - fn_rate)
+    ("impact_exact_case_rate", "up", True),  # "found the correct edit site" per symbol
     ("wrong_symbol_same_name_rate", "down", True),
     ("duplicate_card_rate", "down", True),
     ("ambiguous_ref_rate", "down", True),
@@ -736,9 +767,10 @@ def cast_eval(repo: str = ".") -> dict:
     return out
 
 
-def perquery(repo: str = ".", gold=None) -> None:
+def perquery(repo: str = ".", gold=None, impact_gold=None) -> None:
     """Per-query rank + top-1 ref — for diffing two index states (e.g. heuristic vs
-    enriched) to see exactly which query moved."""
+    enriched) to see exactly which query moved. Also prints per-symbol caller-edge detail
+    (got vs gold, missing/extra) so a non-zero FP/FN can be adjudicated against the source."""
     gold = gold or GOLD
     settings = Settings.load(repo)
     retriever = Retriever(settings)
@@ -748,6 +780,15 @@ def perquery(repo: str = ".", gold=None) -> None:
         top1 = res[0].ref if res else "-"
         print(f"[{i:2d}] rank={'-' if rank is None else rank}  {item['q'][:46]:46s} top1={top1}")
     retriever.close()
+
+    print("\n=== Caller-edge per-symbol (impact gold) ===")
+    for row in _impact_per_case(settings, impact_gold):
+        flag = "exact" if row["exact"] else "DIFF "
+        print(f"  [{flag}] {row['ref']}")
+        if row["missing"]:
+            print(f"            missing (FN): {row['missing']}")
+        if row["extra"]:
+            print(f"            extra   (FP): {row['extra']}")
 
 
 if __name__ == "__main__":
@@ -783,7 +824,7 @@ if __name__ == "__main__":
         gold, impact_gold = load_tasks(args.tasks)
 
     if args.perquery:
-        perquery(args.repo, gold=gold)
+        perquery(args.repo, gold=gold, impact_gold=impact_gold)
     elif args.baselines:
         baselines(args.repo, gold=gold)
     elif args.cast:

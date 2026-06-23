@@ -443,3 +443,55 @@ unchanged) does not recover it, and the FAIL reproduces **identically before thi
 this change never touches). Restoring green needs a deliberate, user-authorized re-baseline
 (`--save roadmap_v2_baseline` after a full reindex + re-derived `IMPACT_GOLD`) — out of scope
 for #9 and tracked as the documented "same-corpus only" discipline.
+
+## Relation/edge eval set (Improvements5 "relation evals" / ROADMAP Step 1 #11) (2026-06-23)
+
+**The gap this closes.** Edge correctness was measured on only **2** hand-authored symbols
+(`IMPACT_GOLD`) plus the hermetic M1 regression test. `docs/Improvements5.txt` asked for a real
+**relation eval** — precision/recall over a set of symbols with expected related refs. (Distinct
+from #9, which is *retrieval ranking*; this is *graph-edge* correctness — the "did the tool find
+the correct edit site" relation.) See `docs/IMPROVEMENTS5_ASSESSMENT.md` for the full alignment
+verdict that scoped this as the one "adopt now" item.
+
+**What shipped.**
+- **`gold.IMPACT_GOLD` 2 → 10 cases** — the CALLER (edit-impact) edge for 10 uniquely-named
+  symbols, each `true_direct` re-derived 2026-06-23 by exhaustive `grep` independent of the tool
+  (anti-circular), mapping every call site to its enclosing symbol.
+- **New metrics in `run_eval.py`**: `edge_precision`, `edge_recall` (micro-averaged over all gold
+  callers) and `impact_exact_case_rate` (fraction of symbols where the tool returned ALL and ONLY
+  the real callers — stricter than the micro rates; the per-symbol "correct edit site" signal).
+  All three are **hard-gated**; `impact_fp/fn` retained.
+- **`--perquery` now prints per-symbol caller-edge detail** (got vs gold, missing=FN, extra=FP) —
+  the adjudication tool for deciding whether a non-zero FP/FN is a real tool limit or a stale gold.
+- **+2 hermetic M1 locks** (`test_caller_graph_regression.py`): nested-function (closure) caller
+  attribution (`outer.inner`, not `outer`) and cross-file bare-call recall via the unique-name
+  fallback — the two mechanisms the cross-file gold relies on. **7/7 pass.**
+
+**Result (against the EXISTING index, 10 cases).** `edge_precision = edge_recall =
+impact_exact_case_rate = 1.000`; `impact_fp = impact_fn = 0.000`. **Caveat — not yet confirmed on
+current code:** this run used `pandemonium.db` dated Jun-22 while the source is Jun-23 (post-Tier-3),
+so it validated *gold vs. the existing index*, not *gold vs. the current `graph.py` edge extraction*.
+graph.py's Tier-3 diff was small (residual risk low, not zero) — a single fresh-reindex run on a
+quiescent repo is needed to confirm and to set the canonical baseline. The gold itself is grepped
+from current source, so it's sound regardless. The expansion **fixes the `impact_fp 0→0.273` drift
+the #9 note flagged**: the old 2-case gold's `is_test_path` entry pre-dated the `viz.py` callers, and
+those three calls live in NESTED helpers inside `build_graph_data` (`ensure_dir_chain`/`ensure_file`/
+`ensure_symbol`) — the eval's own per-case diff caught the misattribution, confirmed by reading
+`viz.py`, and the gold now carries the nested-qualified refs.
+
+**Honest scope — this is a regression LOCK, not (yet) a measurement of the weak spots.** The
+targets are deliberately **uniquely-named** symbols whose callers resolve cleanly, so `P=R=1.0` is
+the *expected pass state* — by construction the set instruments the **static, clean call edges the
+tool was already strong on**, and locks them against silent regression (the #1 historical failure
+mode). It does **NOT** yet exercise the relations Improvements5 actually flagged as weak — framework/
+dynamic/config/event edges, or **ambiguous/colliding-name** callers where recall < 1 is the real
+signal. It's also **10 cases, not the 20–50** Improvements5 envisioned. So read this as "first
+increment + regression lock," not "measured the gap." Documented next increments: colliding-name
+caller cases (recall < 1 as the expected, labelled signal) and `callees`/`imports`/`inherits`/
+`tested_by` precision (currently caller/edit-impact edge only).
+
+**Canonical baseline NOT re-saved.** Validated via a throwaway label (`--save edge_smoke` →
+`--gate edge_smoke` = PASS, then removed); `roadmap_v2_baseline` is left untouched because
+re-saving it would also bake in the pre-existing **retrieval** drift and requires the full reindex
+the #9 note already scopes as a deliberate, user-authorized re-baseline. The gate is
+backward-compatible meanwhile (it skips metrics absent from the older baseline).
