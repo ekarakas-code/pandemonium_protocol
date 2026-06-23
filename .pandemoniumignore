@@ -9,8 +9,19 @@
 venv/
 env/
 
-# --- eval/test fixture corpora (indexed separately by their own eval modes) ---
-evals/fixtures/
+# --- eval harness + diagnostic scaffolding (NOT user-navigable source) ---
+# The eval harness imports gold.py from disk (sys.path), never from the index, so
+# excluding evals/ is safe. evals/gold.py embeds the 15 query strings verbatim — indexing
+# it makes the eval's own labels the top distractor for its own queries (self-contamination).
+# Fixture corpora here are already indexed separately by their own eval modes (--cpp etc.).
+evals/
+# generated / vendored viz assets (minified JS/CSS, served from disk — not source to search)
+pandemonium/_assets/
+# agent/skill config + drivers (e.g. .claude/skills/.../driver.py — a `run` name collision)
+.claude/
+# throwaway root probe / diagnostic scripts
+_diag_index.py
+_probe_stem.py
 
 # --- generated / build / vendor ---
 node_modules/

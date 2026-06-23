@@ -495,3 +495,51 @@ caller cases (recall < 1 as the expected, labelled signal) and `callees`/`import
 re-saving it would also bake in the pre-existing **retrieval** drift and requires the full reindex
 the #9 note already scopes as a deliberate, user-authorized re-baseline. The gate is
 backward-compatible meanwhile (it skips metrics absent from the older baseline).
+
+## Retrieval gate FAIL — CONFIRMED real on a fresh full index (2026-06-23, session 4)
+
+**Correction to the `#9` note above.** That note filed the gate FAIL as "dogfood drift, not
+this change" — an incremental-reindex artifact. This session **disproves that**: the FAIL
+reproduces on a **fresh `index . --full`** (db rebuilt 2026-06-23), so it is a real index state,
+not a stale-incremental artifact. Graph/edge metrics stay clean (`impact_fp/fn` 0, edge P/R 1.0,
+`impact_exact_case` 1.0) — it is purely a **retrieval-ranking** regression. Honest gate
+(answer-key self-exclusion applied, docs KEPT) vs the restored 2026-06-20 baseline: `precision@1`
+0.467→0.333, `@3` 0.667→0.600, `@5` 0.800→0.667, `mrr` 0.584→0.469, `resolution_rate`
+0.733→0.333, `wrong_symbol_same_name_rate` 0.000→0.500; tokens warn.
+
+**Root cause decomposes into two separable parts** (per-query evidence via `--perquery`):
+
+1. **MEASUREMENT ARTIFACT (self-contamination).** The index included the eval's OWN answer key
+   (`evals/gold.py::GOLD` carries the 15 query strings verbatim — it was top-1 for 4/5 misses),
+   generated viz JS (`pandemonium/_assets/`, 139 chunks), probe scripts (`_diag_index.py` /
+   `_probe_stem.py`, 32 chunks), and agent config (`.claude/`). Fixed by `.pandemoniumignore`
+   self-exclusion (a measurement fix, analogous to the already-excluded `evals/fixtures/`).
+   Verified: after a full reindex, `chunks LIKE '%evals/%' / '%_assets/%' / '%.claude/%'` = 0.
+
+2. **REAL RANKING WEAKNESS (general, not repo-specific).** Even with the scaffolding removed,
+   implementations stay buried because the deeper extraction (`7cedf8a`) added distractors that
+   are *real code*, which hygiene cannot remove: **thin dispatch wrappers** outrank
+   implementations (`cli/main.py::tests` rank 0 vs `retrieval/tests_finder.py::find_tests` ~rank
+   17; `cli/main.py::map` / `mcp::repo_map` over `mapping.py::build_repo_map`); **prose docs**
+   outrank code on code-intent queries; and **bulk data-constants** (`GOLD`/`MODELS`/`TASKS`)
+   are searchable distractor cards. Partial gold-staleness: `service.py::detect_changes` is a
+   correct, *uncredited* answer for the incremental-indexing query (a gold question, not a rank
+   fault).
+
+**Decisions (explicit — to avoid overfitting the dogfood gold):**
+- **NOT re-baselined.** A re-baseline to the regressed numbers was tried and **reverted** — it
+  only lowers the bar to hide the drop. `roadmap_v2_baseline.json` is restored to the honest
+  2026-06-20 values; the gate is honestly red on the real residual.
+- **Docs NOT excluded** as the fix (doc retrieval is a legitimate feature). The real fix is a
+  ranking-time content-type signal, not "hide prose from the index."
+- **The fix is a GENERAL reranker with three structural signals** — thin-delegator (via the call
+  graph), code-vs-prose (via `language`), constant-density (via `chunk_type`) — plugged into
+  `hybrid_search.py::_base_search` (before dedup), bypassing the exact-symbol short-circuit and
+  the `channels_only` baselines, preserving the deterministic `chunk_id` tiebreak. It ships only
+  when proven on an **external repo** via `--tasks` crossover (win on dispatcher/doc-buried
+  queries WHILE not losing on exact-symbol/control), never tuned to the 15-query gold.
+- **Patch 1–2 landed:** the self-exclusion hygiene above, and `run_eval.py --signals` — an
+  OBSERVE-ONLY report of the three signals per top card (no ranking change), so Patches 3–5
+  (delegator / prose / density rerank) can be calibrated and ablated against real evidence.
+- **Honesty caveat:** if `wrong_symbol_same_name_rate` later recovers, part of that is the
+  collision set shrinking as scaffolding leaves the index, **not** disambiguation logic improving.
