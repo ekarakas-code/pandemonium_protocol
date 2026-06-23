@@ -96,6 +96,16 @@ def copy_env(work: Path) -> dict:
     e["PYTHONPATH"] = str(work)
     e["HF_HUB_OFFLINE"] = "1"
     e["TRANSFORMERS_OFFLINE"] = "1"
+    # Offline is forced above, so the model/tiktoken MUST be in a cache the subprocess can
+    # see. The bge model + BPE live in THIS repo's .pandemonium cache (downloaded on first
+    # index); point HF_HOME / TIKTOKEN_CACHE_DIR there unless the caller already set them.
+    # Without this, Arm B's reindex fails offline -> Arm B silently runs WITHOUT the protocol.
+    hf = SRC / ".pandemonium" / "hf"
+    tk = SRC / ".pandemonium" / "tiktoken"
+    if "HF_HOME" not in e and hf.exists():
+        e["HF_HOME"] = str(hf)
+    if "TIKTOKEN_CACHE_DIR" not in e and tk.exists():
+        e["TIKTOKEN_CACHE_DIR"] = str(tk)
     return e
 
 

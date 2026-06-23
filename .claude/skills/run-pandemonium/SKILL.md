@@ -105,12 +105,18 @@ working directory (the target repo):
 {
   "mcpServers": {
     "pandemonium": {
-      "command": "D:\\PandemoniumProtocol\\.venv\\Scripts\\pandemonium.exe",
+      "command": "pandemonium",
       "args": ["serve-mcp", "--repo", "."]
     }
   }
 }
 ```
+
+> **Resolve `command` to YOUR install.** `"pandemonium"` works only if it's on the PATH that
+> your agent launches with (global install, or the venv is active). Otherwise use the FULL path
+> to the executable — find it with `(Get-Command pandemonium).Source` (PowerShell) or
+> `which pandemonium` (POSIX); e.g. `C:/path/to/PandemoniumProtocol/.venv/Scripts/pandemonium.exe`
+> (forward slashes, or escaped `\\` in JSON). Do **not** copy a path from another machine.
 
 The agent then has 15 tools — `repo_context_pack` (start a task), `repo_brief` (pre-flight
 verified-vs-guess brief), `repo_search` → `repo_get`, `repo_graph` / `repo_impact` /
