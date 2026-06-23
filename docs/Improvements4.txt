@@ -1,0 +1,288 @@
+Yes — let’s reset the framing.
+
+The state-of-the-art direction is **not** “make chunks bigger” and not “give the agent arbitrary 60-line windows.” The stronger pattern is:
+
+> **Index small, structured retrieval units; deliver complete, expanded reasoning units.**
+
+Your architecture is already close to that: search returns cards, cards point to refs, raw code is fetched only after the agent chooses a ref, and descriptors — not raw code — are embedded.  The main place to tighten is the boundary between **retrieval chunk** and **LLM reading context**.
+
+One implementation caveat: the architecture says the measured decision was **symbol-only wins** and file/code-on-parsed “hurt or cost,” but the uploaded `chunker.py` still has `DEFAULT_SCOPES = ("symbol", "file", "code")`, creates parsed-file window chunks when `"code"` is enabled, and splits large symbol spans into line windows.   If `index_runner.py` overrides scopes to symbol-only at runtime, fine. If not, there is real drift.
+
+## State-of-the-art approaches to code chunking / retrieval
+
+| Approach                                       | Core idea                                                                                                                                                                                                                                                                                                      | What it solves                                                                                                                                                                                            | Weakness                                                                                                                                                                                 | Fit for Pandemonium                                                                                                                                        |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. Fixed line/token windows**                | Split files into N-line or N-token chunks with overlap.                                                                                                                                                                                                                                                        | Simple, language-agnostic fallback.                                                                                                                                                                       | Can split functions, branches, setup/teardown, or merge unrelated logic. Recent AST-chunking work explicitly calls out line-based chunking as breaking semantic structures. ([arXiv][1]) | Keep only for **non-code / unsupported / no-symbol** fallback. Do not make it first-class for parseable code.                                              |
+| **2. Symbol-level chunking**                   | One retrieval unit per function/method/class/interface/etc.                                                                                                                                                                                                                                                    | Strong match to how developers reason about code. Reduces half-logic chunks.                                                                                                                              | Large functions/classes still need special handling.                                                                                                                                     | This should remain your default. Your architecture already says parsed files become symbol cards and non-parsed files get block coverage.                  |
+| **3. AST-structural chunking**                 | Use AST nodes, recursively split large nodes, and merge siblings while respecting size limits.                                                                                                                                                                                                                 | Avoids random line splits while still controlling chunk size. cAST reports improved retrieval and generation outcomes over line-based chunking. ([arXiv][1])                                              | More implementation work per language. Need parser quality.                                                                                                                              | Best replacement for your current large-symbol 60-line windowing.                                                                                          |
+| **4. Adaptive structure-aware segmentation**   | Build retrieval units from complete functions/classes and adapt size based on logical structure.                                                                                                                                                                                                               | Directly targets code logic fragmentation from fixed-line segmentation. ([Springer Nature Link][2])                                                                                                       | Can become heuristic-heavy.                                                                                                                                                              | Good design principle: **functional completeness beats uniform chunk size**.                                                                               |
+| **5. Parent-child retrieval**                  | Search small child chunks, but return the larger parent document/unit.                                                                                                                                                                                                                                         | Balances precise search with coherent context. LangChain’s ParentDocumentRetriever documents this exact pattern: small chunks for search, larger parents for final return. ([reference.langchain.com][3]) | Parent can be too large unless the parent is chosen carefully.                                                                                                                           | Excellent fit: search descriptor cards, then return full symbol + class header + imports + direct dependencies.                                            |
+| **6. Hierarchical summary retrieval**          | Build multiple abstraction layers: chunks → summaries → cluster/file/module summaries. RAPTOR recursively embeds, clusters, and summarizes chunks to retrieve at different abstraction levels. ([arXiv][4])                                                                                                    | Helps with broad architectural queries and multi-hop reasoning.                                                                                                                                           | Summaries can drift; needs grounding back to code.                                                                                                                                       | Add file/module/package outline cards, but keep `repo_get` as source of truth.                                                                             |
+| **7. Contextualized chunk embeddings**         | Add local/global context to each chunk before embedding and BM25 indexing. Anthropic reports Contextual Retrieval reduces failed retrievals by 49%, and by 67% with reranking. ([anthropic.com][5])                                                                                                            | Solves “this small chunk lost its meaning outside the file.”                                                                                                                                              | Cost if LLM-generated; quality depends on context text.                                                                                                                                  | Your descriptor approach is already a code-specific version. Enrich descriptors with callers/callees, parent class, route/event names, config keys, tests. |
+| **8. Hybrid retrieval + reranking**            | Combine symbol search, keyword/BM25, dense vectors, then rerank.                                                                                                                                                                                                                                               | Code queries are mixed: sometimes exact names, sometimes concepts.                                                                                                                                        | More moving parts; reranker latency.                                                                                                                                                     | Already aligned: your architecture has symbol + FTS5 + vector merge. Add optional reranker before context pack.                                            |
+| **9. Graph-aware retrieval**                   | Use call/import/inheritance/dependency graph to retrieve related code, not just similar text. RepoGraph argues file-level indexing can find semantically similar files but miss genuinely related snippets; CodexGraph uses graph queries for multi-hop code navigation. ([arXiv][6]) ([laptype.github.io][7]) | Finds callers, callees, interfaces, tests, schemas, routes.                                                                                                                                               | Bad edges can mislead; graph resolution must be conservative.                                                                                                                            | Strong fit. Your graph layer is already conservative and query-time resolved. Use it in `repo_context_pack`, not only as a separate tool.                  |
+| **10. Iterative retrieval-generation**         | Retrieve, generate/plan, retrieve again using the intermediate hypothesis. RepoCoder uses iterative retrieval and generation for repository-level code completion. ([arXiv][8])                                                                                                                                | Initial user query may be too vague; generated hypothesis improves second retrieval.                                                                                                                      | More agent loops; can chase hallucinated paths.                                                                                                                                          | Good for MCP/agent behavior: first search cards, fetch exact refs, then search again using discovered names.                                               |
+| **11. Multi-path / query-aware retrieval**     | Use several retrieval paths and better query construction. CodeRAG uses log-probability-guided query construction, multi-path retrieval, and preference-aligned reranking. ([arXiv][9])                                                                                                                        | Avoids relying on one weak query or one retriever.                                                                                                                                                        | More complex to evaluate.                                                                                                                                                                | Add query expansion modes: symbol-name, natural-language intent, generated pseudo-signature, graph-neighbor expansion.                                     |
+| **12. Selective retrieval**                    | Retrieve only when retrieval is expected to help. Repoformer frames always-on retrieval as sometimes noisy/harmful and reports up to 70% serving speedup with selective retrieval. ([arXiv][10])                                                                                                               | Avoids adding irrelevant context.                                                                                                                                                                         | Needs a confidence/gating signal.                                                                                                                                                        | Useful later: `repo_context_pack` can stop early when top target + tests are enough.                                                                       |
+| **13. Late chunking / long-context embedding** | Encode a long document first, then pool embeddings for chunks afterward so chunk vectors retain broader context. ([arXiv][11])                                                                                                                                                                                 | Reduces context loss in chunk embeddings.                                                                                                                                                                 | Needs long-context embedding model; may be heavier than local bge-small.                                                                                                                 | Experimental. Less urgent than AST splitting + parent expansion.                                                                                           |
+| **14. Benchmark-driven retrieval design**      | Evaluate retrieval against known relevant regions, not vibes. CodeRAG-Bench includes repository-level tasks; CrossCodeEval requires cross-file context; SWE-Explore evaluates ranked relevant code regions under a fixed line budget. ([aclanthology.org][12]) ([crosscodeeval.github.io][13]) ([arXiv][14])   | Prevents cargo-culting chunking methods.                                                                                                                                                                  | Requires building eval data.                                                                                                                                                             | Mandatory before major redesign. Your own architecture already cites measured wins for descriptor embeddings and symbol-only scope.                        |
+
+## What this means for your project
+
+Your current idea is directionally right, but I would phrase it more precisely:
+
+> **Do not give the agent minimal chunks. Give it minimal complete context.**
+
+Those are different.
+
+A tiny chunk can be bad if it contains half a function. A larger context can be good if it contains exactly the complete function, parent class header, imports, direct callee, and one test. The target should be **minimal complete reasoning closure**, not minimal line count.
+
+## The best target design for Pandemonium
+
+I would split the system into three layers:
+
+```text
+1. Retrieval cards
+   Small, cheap, searchable.
+   No raw code required.
+   Examples: function card, method card, class outline card, file outline card.
+
+2. Code atoms
+   Complete source units.
+   Examples: full function, full method, class header + selected method, markdown section,
+   config block, route handler, test case.
+
+3. Context pack
+   Budgeted assembly of complete atoms + relationship context.
+   Never raw top-k chunks dumped directly.
+```
+
+That maps cleanly to your existing architecture: `repo_search` returns cards, `repo_get` fetches exact source, and `repo_context_pack` assembles the “give me everything relevant” markdown pack. 
+
+## Recommended approach list for your case
+
+### 1. Keep symbol cards as the primary retrieval unit
+
+This is still the right default.
+
+For parseable code:
+
+```text
+function/method card
+class outline card
+interface/protocol card
+file outline card, optional
+```
+
+Do **not** index parsed files primarily as arbitrary line windows. Recent work points toward structural chunking because line windows break semantic units. ([arXiv][1])
+
+### 2. Replace large-symbol line splitting with AST-aware subchunks
+
+Current `_spans()` splits a large symbol into 60-line / 10-overlap windows.  That is the biggest risk to your “no half logic” requirement.
+
+Instead, for a 200-line function, create:
+
+```text
+Primary card:
+  ref = path::Qualified.Function
+  range = full 200-line function
+  is_complete_unit = true
+  safe_for_reasoning = true
+
+Internal AST children:
+  ref = path::Qualified.Function#block:validate-input
+  ref = path::Qualified.Function#block:build-query
+  ref = path::Qualified.Function#block:handle-errors
+  is_complete_unit = false or block-complete
+  parent_ref = path::Qualified.Function
+  safe_alone = false unless block is syntactically self-contained
+```
+
+Search can hit the internal child, but final context should auto-upgrade to either the full parent function or a complete AST block plus required setup/return context. This follows the same instinct as cAST: split by AST structure, not by arbitrary lines. ([arXiv][1])
+
+### 3. Add parent expansion as a hard contract
+
+When a search result is selected, do not directly hand over the chunk. Resolve it:
+
+```text
+matched retrieval card
+  -> complete source atom
+  -> parent context
+  -> dependency/test closure
+```
+
+Example:
+
+```text
+Hit:
+  services/orders.py::OrderService.approve
+
+Return:
+  imports used by approve
+  class header + fields
+  full approve method
+  direct callee: send_vendor_email
+  direct caller/route: approve_order_endpoint
+  closest test: test_vendor_email_sent_on_approval
+```
+
+This is basically ParentDocumentRetriever adapted for code: precise children for retrieval, coherent parents for final context. ([reference.langchain.com][3])
+
+### 4. Replace file preview cards with file outline cards
+
+Current file cards use the first 40 lines as content.  That is often imports, comments, constants, or boilerplate.
+
+Better:
+
+```text
+File card:
+  path
+  package/module
+  main responsibility
+  exported symbols
+  classes/functions
+  route/event/config anchors
+  imports
+  test adjacency
+```
+
+This matches the hierarchical-summary direction: summaries and outlines help broad retrieval, while exact code remains separately fetchable. RAPTOR is not code-specific, but the broader lesson is useful: retrieval benefits from multiple abstraction levels, not just flat chunks. ([arXiv][4])
+
+### 5. Enrich descriptors, not raw code embeddings
+
+Your architecture already says descriptors are embedded instead of raw code, and your measured results say descriptors improved precision.  Keep that.
+
+A strong symbol descriptor should look like:
+
+```text
+path: services/purchase_order.py
+scope: method
+qualified_name: PurchaseOrderService.approve
+signature: approve(order_id: str, actor: User) -> ApprovalResult
+parent: PurchaseOrderService
+summary: validates PO state, marks approved, emits vendor notification
+tags: purchase-order, approval, vendor-email, state-transition
+calls: repository.get_order, order.approve, email.send_vendor_po
+called_by: approve_purchase_order_endpoint
+tests: test_vendor_email_sent_on_approval
+side_effects: writes order status, sends email, emits audit event
+config_keys: VENDOR_PO_EMAIL_TEMPLATE
+```
+
+That is your code-specific version of contextual retrieval: each retrievable unit carries enough surrounding context that embeddings and BM25 do not have to infer everything from a tiny isolated snippet. Anthropic’s Contextual Retrieval makes the same general point for RAG: add explanatory context to chunks before embedding/indexing. ([anthropic.com][5])
+
+### 6. Make `repo_context_pack` graph-aware by default
+
+Your graph is already separate from chunks and query-time resolved, which is good.  The next step is to make the packer use it automatically.
+
+For bug-fix / feature tasks, pack in this order:
+
+```text
+Tier 1 — target
+  full target function/method
+  parent class header / fields
+  imports used by target
+
+Tier 2 — execution closure
+  direct callees
+  direct callers / route handlers
+  interfaces / base classes / protocols
+  schema/config referenced by target
+
+Tier 3 — verification
+  nearest tests
+  fixtures/factories
+  mocks
+
+Tier 4 — orientation only
+  file/module outlines
+  related cards whose code does not fit budget
+```
+
+Graph-aware retrieval is a major state-of-the-art direction. RepoGraph and CodexGraph both exist because flat file/snippet retrieval misses repository dependencies and multi-hop relationships. ([arXiv][6]) ([laptype.github.io][7])
+
+### 7. Add `completeness` metadata to every chunk/card
+
+This is the guardrail that directly addresses your concern.
+
+Add metadata like:
+
+```python
+is_complete_unit: bool
+safe_for_reasoning: bool
+safe_for_editing: bool
+parent_ref: str | None
+requires_parent_header: bool
+requires_imports: bool
+contains_full_body: bool
+unit_kind: "function" | "method" | "class_outline" | "file_outline" | "block" | "window"
+```
+
+Then enforce:
+
+```text
+repo_context_pack must not include safe_for_reasoning=false items alone.
+repo_get on a partial item must warn or auto-expand.
+repo_search may return partial/internal hits, but marks them clearly.
+```
+
+This lets you keep small internal retrieval units without ever misleading the agent.
+
+## My ranked recommendation
+
+I would implement this order:
+
+1. **Confirm runtime scopes.** Make sure parseable code defaults to `symbol` only. The uploaded chunker default still includes `file` and `code`, so either change the default or prove `index_runner.py` always overrides it. 
+2. **Demote parsed-file windows.** Keep line windows only for symbol-less files, docs, configs, unsupported languages, and emergency fallback.
+3. **Stop splitting large symbols into ordinary line-window chunks.** Replace with full parent symbol card + AST-aware internal children.
+4. **Add parent/complete-unit expansion.** Search small; return full function/method/class context.
+5. **Replace file preview cards with file outline cards.** First 40 lines is not a semantic representation.
+6. **Make `repo_context_pack` graph-aware.** Include direct callees/callers/tests/interfaces/config under a token budget.
+7. **Add optional reranking.** Use a local reranker or LLM reranker over the top 30–50 cards before packing. Hybrid retrieval plus reranking is a common modern pattern; Anthropic reports large retrieval-failure reductions when contextual retrieval is combined with reranking. ([anthropic.com][5])
+8. **Add iterative retrieval behavior to the skill/MCP discipline.** RepoCoder and CodeRAG both point toward multi-step retrieval rather than one-shot top-k retrieval. ([arXiv][8]) ([arXiv][9])
+9. **Build a retrieval eval set.** Use tasks with gold files/symbols/lines and compare current chunking vs symbol-only vs AST subchunks vs graph expansion.
+
+## The design law I would use
+
+```text
+Search units may be small.
+Reading units must be complete.
+Editing units must include impact context.
+```
+
+So the ideal final design is:
+
+```text
+repo_search(query)
+  -> cards only:
+     symbol cards, class/file outlines, descriptor-rich metadata
+
+repo_get(ref)
+  -> exact code:
+     full symbol by default, not half-window
+
+repo_context_pack(task, budget)
+  -> minimal complete context:
+     target full body
+     parent/import context
+     graph neighbors
+     tests
+     outlines for overflow
+```
+
+That gives you modern retrieval behavior without violating your core principle: **never make the agent reason from half-done code or half-done logic.**
+
+[1]: https://arxiv.org/abs/2506.15655?utm_source=chatgpt.com "cAST: Enhancing Code Retrieval-Augmented Generation with Structural Chunking via Abstract Syntax Tree"
+[2]: https://link.springer.com/article/10.1007/s10664-025-10762-7?utm_source=chatgpt.com "Repository-level code completion with adaptive segmentation ... - Springer"
+[3]: https://reference.langchain.com/python/langchain-classic/retrievers/parent_document_retriever?utm_source=chatgpt.com "parent_document_retriever | langchain_classic"
+[4]: https://arxiv.org/abs/2401.18059?utm_source=chatgpt.com "RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval"
+[5]: https://www.anthropic.com/news/contextual-retrieval?utm_source=chatgpt.com "Contextual Retrieval in AI Systems \ Anthropic"
+[6]: https://arxiv.org/html/2410.14684v1?utm_source=chatgpt.com "RepoGraph: Enhancing AI Software Engineering with Repository-level Code ..."
+[7]: https://laptype.github.io/CodexGraph-page/?utm_source=chatgpt.com "CodexGraph - laptype.github.io"
+[8]: https://arxiv.org/abs/2303.12570?utm_source=chatgpt.com "RepoCoder: Repository-Level Code Completion Through Iterative Retrieval and Generation"
+[9]: https://arxiv.org/abs/2509.16112?utm_source=chatgpt.com "CodeRAG: Finding Relevant and Necessary Knowledge for Retrieval ..."
+[10]: https://arxiv.org/abs/2403.10059?utm_source=chatgpt.com "Repoformer: Selective Retrieval for Repository-Level Code Completion"
+[11]: https://arxiv.org/abs/2409.04701?utm_source=chatgpt.com "Late Chunking: Contextual Chunk Embeddings Using Long-Context Embedding Models"
+[12]: https://aclanthology.org/2025.findings-naacl.176/?utm_source=chatgpt.com "CodeRAG-Bench: Can Retrieval Augment Code Generation?"
+[13]: https://crosscodeeval.github.io/?utm_source=chatgpt.com "GitHub Pages - CrossCodeEval"
+[14]: https://arxiv.org/abs/2606.07297?utm_source=chatgpt.com "SWE-Explore: Benchmarking How Coding Agents Explore Repositories"

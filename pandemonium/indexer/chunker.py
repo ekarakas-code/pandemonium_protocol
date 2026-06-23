@@ -1,8 +1,10 @@
-"""Code-aware chunking, scope-aware (Phase 4).
+"""Code-aware chunking, scope-aware (Phase 4; cAST subchunking — Improvements4 #3).
 
 Emitters, gated by `scopes`:
-  symbol : one chunk per function/method + a class-header chunk (chunk_type =
-           class|method|function, scope=symbol). Large spans split into windows.
+  symbol : one chunk per function/method (the FULL span — never line-split) + a class-header
+           chunk (chunk_type = class|method|function, scope=symbol). A large NON-class symbol
+           ALSO gets block-complete `ast_block` children (cAST) for precise search; delivery
+           auto-upgrades a child hit to its complete parent symbol.
   code   : line-window chunks (chunk_type=window for parsed files; chunk_type=block
            is ALWAYS emitted for files with no symbols, as mandatory coverage).
   file   : a single file-scope card (chunk_type=file) per file.
@@ -15,10 +17,13 @@ from __future__ import annotations
 
 from typing import Iterator, List, Sequence, Tuple
 
+from pandemonium.indexer.tree_sitter_parser import extract_symbol_blocks
 from pandemonium.models import Chunk, Symbol
 from pandemonium.util import chunk_id_for, sha256_text
 
-DEFAULT_SCOPES = ("symbol", "file", "code")
+# Runtime always passes scopes from settings (default ["symbol"], settings.py). The Phase-4
+# bake-off settled symbol-primary; file/code scopes are opt-in. (Was ("symbol","file","code").)
+DEFAULT_SCOPES = ("symbol",)
 _FILE_PREVIEW_LINES = 40
 
 
@@ -39,14 +44,8 @@ def _windows(start: int, end: int, window: int, overlap: int) -> Iterator[Tuple[
         s += step
 
 
-def _spans(start: int, end: int, window: int, overlap: int) -> List[Tuple[int, int]]:
-    if end - start + 1 <= window:
-        return [(start, end)]
-    return list(_windows(start, end, window, overlap))
-
-
-def _symbol_chunks(repo_id, file_id, path, language, lines, symbols, window_lines,
-                   overlap) -> List[Chunk]:
+def _symbol_chunks(repo_id, file_id, path, language, lines, source_bytes, symbols,
+                   subchunk_min_lines) -> List[Chunk]:
     chunks: List[Chunk] = []
     for sym in symbols:
         if sym.symbol_type == "class":
@@ -57,13 +56,29 @@ def _symbol_chunks(repo_id, file_id, path, language, lines, symbols, window_line
             start, end = sym.start_line, header_end
         else:
             start, end = sym.start_line, sym.end_line
-        for ws, we in _spans(start, end, window_lines, overlap):
-            content = _slice(lines, ws, we)
-            if not content.strip():
-                continue
-            cid = chunk_id_for(file_id, ws, we, sym.symbol_type)
+        # The full symbol (or class header) as ONE complete unit — no line-window splitting.
+        # The parent symbol is always the reading/delivery target.
+        content = _slice(lines, start, end)
+        if content.strip():
+            cid = chunk_id_for(file_id, start, end, sym.symbol_type)
             chunks.append(Chunk(cid, repo_id, file_id, sym.id, sym.symbol_type, language,
-                                path, ws, we, content, None, sha256_text(content)))
+                                path, start, end, content, None, sha256_text(content)))
+        # cAST: a large non-class symbol ALSO gets block-complete `ast_block` children so a
+        # query can hit a precise sub-block; index_runner stamps parent_ref for auto-upgrade.
+        if sym.symbol_type != "class":
+            pqn = sym.qualified_name or sym.name
+            for blk in extract_symbol_blocks(source_bytes, language, start, end,
+                                             min_lines=subchunk_min_lines):
+                bcontent = _slice(lines, blk.start_line, blk.end_line)
+                if not bcontent.strip():
+                    continue
+                bcid = chunk_id_for(file_id, blk.start_line, blk.end_line, "ast_block")
+                # Carry the block slug forward as a human-readable label (e.g.
+                # `OrderService.approve#block:validate`); the resolvable ref stays line-based.
+                chunks.append(Chunk(bcid, repo_id, file_id, sym.id, "ast_block", language,
+                                    path, blk.start_line, blk.end_line, bcontent, None,
+                                    sha256_text(bcontent),
+                                    qualified_name=f"{pqn}#block:{blk.slug}", parent=pqn))
     return chunks
 
 
@@ -91,14 +106,16 @@ def _file_card(repo_id, file_id, path, language, lines) -> Chunk:
 
 def build_chunks(repo_id: str, file_id: str, path: str, language: str, text: str,
                  symbols: List[Symbol], scopes: Sequence[str] = DEFAULT_SCOPES,
-                 window_lines: int = 60, overlap: int = 10) -> List[Chunk]:
+                 window_lines: int = 60, overlap: int = 10,
+                 subchunk_min_lines: int = 60) -> List[Chunk]:
     lines = text.splitlines()
     chunks: List[Chunk] = []
 
     if symbols:
         if "symbol" in scopes:
-            chunks += _symbol_chunks(repo_id, file_id, path, language, lines, symbols,
-                                     window_lines, overlap)
+            source_bytes = text.encode("utf-8", "replace")
+            chunks += _symbol_chunks(repo_id, file_id, path, language, lines, source_bytes,
+                                     symbols, subchunk_min_lines)
         if "code" in scopes:  # supplementary line-windows for parsed files (bake-off)
             chunks += _window_chunks(repo_id, file_id, path, language, lines,
                                      window_lines, overlap, "window")

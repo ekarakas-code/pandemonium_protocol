@@ -18,6 +18,7 @@ class Candidate:
     rel_path: str  # repo-relative POSIX
     language: str
     size: int
+    mtime: float = 0.0  # st_mtime captured during the scan stat (reused by the auto-reindexer)
 
 
 def scan(repo_root: Any, matcher: IgnoreMatcher,
@@ -42,11 +43,11 @@ def scan(repo_root: Any, matcher: IgnoreMatcher,
             if not language:
                 continue
             try:
-                size = abs_p.stat().st_size
+                st = abs_p.stat()
             except OSError:
                 continue
-            if size > max_file_bytes:
+            if st.st_size > max_file_bytes:
                 if skipped_large is not None:
                     skipped_large.append(rel)
                 continue
-            yield Candidate(str(abs_p), rel, language, size)
+            yield Candidate(str(abs_p), rel, language, st.st_size, st.st_mtime)

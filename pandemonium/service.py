@@ -51,16 +51,21 @@ def context_pack(settings, task: str, token_budget: Optional[int] = None,
 
 def get(settings, ref: str, expand: str = "exact", view: str = "full"):
     """Resolve a ref to exact code (edit-stable for symbol refs). `view` narrows the span
-    (full | signature | head:N | lines:a-b) to save tokens. Returns ResolvedCode."""
+    (full | signature | head:N | lines:a-b) to save tokens. A partial cAST `ast_block` child
+    auto-upgrades to its complete parent (expand="block" opts out). Returns ResolvedCode."""
     AuditLog(settings.audit_log_path).log("repo_get", surface="cli", ref=ref,
                                           expand=expand, view=view)
     store = SqliteStore(settings.sqlite_path)
     store.create_schema()
+    repo_id = repo_id_for(settings.repo_root)
     try:
-        row = store.chunk_by_ref(repo_id_for(settings.repo_root), ref)
+        row = store.chunk_by_ref(repo_id, ref)
+        return refs.resolve_with_upgrade(
+            settings.repo_root, ref, row,
+            fetch_row=lambda r: store.chunk_by_ref(repo_id, r),
+            expand=expand, view=view)
     finally:
         store.close()
-    return refs.resolve_from_row(settings.repo_root, ref, row, expand=expand, view=view)
 
 
 def staleness(settings, refs: Optional[List[str]] = None) -> List[dict]:

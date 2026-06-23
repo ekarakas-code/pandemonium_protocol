@@ -926,7 +926,7 @@ def _similar_for(store, lance, repo_id: str, target, k: int = 5) -> list:
     return out
 
 
-def repo_graph(settings, ref: str) -> Optional[dict]:
+def repo_graph(settings, ref: str, graph=None) -> Optional[dict]:
     """Related code for a ref: callees, callers, imports, inheritance, members, tests,
     similar implementations (vector), and any LLM-inferred 'affects' hypotheses."""
     from pandemonium.retrieval.tests_finder import find_tests
@@ -935,12 +935,12 @@ def repo_graph(settings, ref: str) -> Optional[dict]:
     from pandemonium.util import repo_id_for
     from pandemonium import refs as refs_mod
 
-    path, qname, _ = refs_mod.parse_ref(ref)
+    path, qname, _, _ = refs_mod.parse_ref(ref)
     store = SqliteStore(settings.sqlite_path)
     store.create_schema()
     repo_id = repo_id_for(settings.repo_root)
     try:
-        idx = GraphIndex(store, repo_id)
+        idx = graph if graph is not None else GraphIndex(store, repo_id)
         target = _resolve_target(idx, path, qname)
         if target is None:
             return None
@@ -1053,7 +1053,7 @@ def render_graph(g: dict, show_evidence: bool = False) -> str:
     return "\n".join(out)
 
 
-def repo_impact(settings, ref: str, depth: int = 2) -> Optional[dict]:
+def repo_impact(settings, ref: str, depth: int = 2, graph=None) -> Optional[dict]:
     """What may be affected if `ref` changes: transitive callers (BFS over the resolved
     caller relation, up to `depth` hops), the files they live in, and related tests.
     Conservative by design — only confidently-resolved callers, so it under-claims rather
@@ -1063,12 +1063,12 @@ def repo_impact(settings, ref: str, depth: int = 2) -> Optional[dict]:
     from pandemonium.util import repo_id_for
     from pandemonium import refs as refs_mod
 
-    path, qname, _ = refs_mod.parse_ref(ref)
+    path, qname, _, _ = refs_mod.parse_ref(ref)
     store = SqliteStore(settings.sqlite_path)
     store.create_schema()
     repo_id = repo_id_for(settings.repo_root)
     try:
-        idx = GraphIndex(store, repo_id)
+        idx = graph if graph is not None else GraphIndex(store, repo_id)
         target = _resolve_target(idx, path, qname)
         if target is None:
             return None
@@ -1242,15 +1242,15 @@ def _edit_risks(settings, ref: str, g: dict, imp: dict, tests: List[str]) -> Lis
     return risks
 
 
-def edit_plan(settings, ref: str) -> Optional[dict]:
+def edit_plan(settings, ref: str, graph=None) -> Optional[dict]:
     """A ranked change plan for `ref`, composed from repo_impact + repo_graph +
     find_tests: the primary target, direct callers to keep compatible, transitive reach,
     tests to update, dependencies to read, coupling hypotheses, risks, and a suggested
     fetch order. The answer to 'I'm about to change this — what do I need first?'."""
-    g = repo_graph(settings, ref)
+    g = repo_graph(settings, ref, graph=graph)
     if g is None:
         return None
-    imp = repo_impact(settings, ref) or {}
+    imp = repo_impact(settings, ref, graph=graph) or {}
     target = g["ref"]
     direct = imp.get("direct", [])
     deps = [c["ref"] for c in g.get("callees", [])]
@@ -1307,7 +1307,7 @@ def render_edit_plan(p: dict) -> str:
     return "\n".join(out)
 
 
-def repo_logic_map(settings, topic: str, top_k: int = 12) -> Optional[dict]:
+def repo_logic_map(settings, topic: str, top_k: int = 12, graph=None) -> Optional[dict]:
     """Conceptual flow for a topic: the relevant symbols (semantic search), the domains
     and files they live in, and how they call each other — a grounded 'logic map'."""
     from pandemonium.retrieval.hybrid_search import Retriever
@@ -1318,7 +1318,7 @@ def repo_logic_map(settings, topic: str, top_k: int = 12) -> Optional[dict]:
         if not results:
             return None
         store, repo_id = retriever.sqlite, retriever.repo_id
-        idx = GraphIndex(store, repo_id)
+        idx = graph if graph is not None else GraphIndex(store, repo_id)
         refs = {r.ref for r in results if r.ref}
 
         domain_count: dict = {}

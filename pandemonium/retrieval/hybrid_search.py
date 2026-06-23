@@ -152,9 +152,12 @@ def _collapse_by_ref(results: List[SearchResult]) -> List[SearchResult]:
         kept = out[pos[key]]
         if r.score < kept.score - 1e-9:
             continue  # strictly lower score -> the kept card wins
+        # On a score tie, prefer the COMPLETE unit (the full symbol) over a partial cAST
+        # `ast_block` child sharing its symbol_id, so the card the agent sees is whole.
+        better_complete = r.is_complete_unit and not kept.is_complete_unit
         better_scope = (r.scope == "symbol") and (kept.scope != "symbol")
         earlier = (r.scope == kept.scope) and (r.start_line < kept.start_line)
-        if better_scope or earlier:
+        if better_complete or better_scope or earlier:
             out[pos[key]] = r
     return out
 
@@ -165,6 +168,12 @@ def _dedup(results: List[SearchResult]) -> List[SearchResult]:
         if not any(_overlaps(k, r) for k in kept):
             kept.append(r)
     return kept
+
+
+def _complete(row) -> bool:
+    """cAST is_complete_unit from a chunk row; legacy rows (no column) read as complete."""
+    ic = _row_get(row, "is_complete_unit")
+    return True if ic is None else bool(ic)
 
 
 def _reason(r: SearchResult) -> str:
@@ -408,7 +417,10 @@ class Retriever:
                 summary=row["summary"], channel_scores=contributions,
                 ref=_row_get(row, "ref"), scope=_row_get(row, "scope"),
                 qualified_name=_row_get(row, "qualified_name"),
-                tags=_parse_tags(_row_get(row, "tags"))))
+                tags=_parse_tags(_row_get(row, "tags")),
+                unit_kind=_row_get(row, "unit_kind"),
+                is_complete_unit=_complete(row), safe_for_reasoning=_complete(row),
+                parent_ref=_row_get(row, "parent_ref")))
 
         results = (_dedup(results) if dedup else results)[:top_k]
         for res in results:

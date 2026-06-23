@@ -38,18 +38,26 @@ class AutoReindexer:
         self._clock = clock
         self._last_check = float("-inf")
         self._snapshot: Optional[Dict[str, float]] = None  # rel_path -> mtime; None = unprimed
+        self._matcher_cache: Optional[IgnoreMatcher] = None
+        self._matcher_sig: Optional[tuple] = None
+
+    def _matcher(self, root: Path) -> IgnoreMatcher:
+        """Cache the parsed IgnoreMatcher; reload only when .pandemoniumignore / .gitignore
+        actually change. Re-parsing the ignore files on every debounced scan is wasted work."""
+        sig = tuple((p.stat().st_mtime if p.exists() else 0.0)
+                    for p in (root / ".pandemoniumignore", root / ".gitignore"))
+        if self._matcher_cache is None or sig != self._matcher_sig:
+            self._matcher_cache = IgnoreMatcher.load(root)
+            self._matcher_sig = sig
+        return self._matcher_cache
 
     def _scan_mtimes(self) -> Dict[str, float]:
         root = Path(self.settings.repo_root)
-        matcher = IgnoreMatcher.load(root)
+        matcher = self._matcher(root)
         max_bytes = self.settings.section("indexing").get("max_file_bytes", 2_000_000)
-        out: Dict[str, float] = {}
-        for cand in scan(root, matcher, max_file_bytes=max_bytes, skipped_large=[]):
-            try:
-                out[cand.rel_path] = Path(cand.abs_path).stat().st_mtime
-            except OSError:
-                pass
-        return out
+        # Reuse the st_mtime scan() already captured per Candidate — no second stat per file.
+        return {cand.rel_path: cand.mtime
+                for cand in scan(root, matcher, max_file_bytes=max_bytes, skipped_large=[])}
 
     def prime(self) -> None:
         """Record current file mtimes as the baseline. Call once when the index is known

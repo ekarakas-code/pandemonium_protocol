@@ -696,6 +696,46 @@ def baselines(repo: str = ".", gold=None) -> dict:
     return metrics
 
 
+# ---------------------------------------------------------------------------
+# cAST subchunking A/B (Improvements4 #3) — SEPARATE from --gate (a measurement, not a lock).
+#
+# Re-indexes the repo with the REAL model twice: subchunking OFF (whole-symbol cards only) vs
+# ON (full symbol + block-complete `ast_block` children), and compares retrieval on the gold
+# set. The design law is "search small, read complete": children add precise sub-block recall
+# while the full symbol stays the delivered unit, so the bar is "cAST holds (>=) whole-symbol
+# precision/MRR" — not a big precision jump on this symbol-shaped gold. The real win (a query
+# whose TRUE region is a sub-block of a large function) needs a sub-block gold set + large-repo
+# tasks; this arm reports the no-regression guardrail + how many ast_block children surface.
+# ---------------------------------------------------------------------------
+def cast_eval(repo: str = ".") -> dict:
+    arms = {"whole-symbol": 10 ** 9, "cAST(+blocks)": 60}  # threshold: disabled vs default
+    out: dict = {}
+    for label, thr in arms.items():
+        settings = Settings.load(repo)
+        settings.data["indexing"]["subchunk_min_lines"] = thr
+        service.index(settings, incremental=False)  # real model, fresh
+        retriever = Retriever(settings)
+        m = _rank_metrics(retriever, GOLD, lambda q: retriever.search(q, top_k=10))
+        ab = sum(1 for item in GOLD for r in retriever.search(item["q"], top_k=10)
+                 if r.chunk_type == "ast_block")
+        retriever.close()
+        out[label] = {**m, "ast_block_hits": ab}
+
+    print("=== cAST subchunking A/B (whole-symbol vs full symbol + ast_block children) ===")
+    print(f"  n={len(GOLD)} queries")
+    print(f"  {'arm':16s} {'P@1':>6} {'P@3':>6} {'P@5':>6} {'symP5':>6} {'MRR':>6} {'astblk':>7}")
+    for label in arms:
+        m = out[label]
+        print(f"  {label:16s} {m['p1']:6.3f} {m['p3']:6.3f} {m['p5']:6.3f} "
+              f"{m['symP5']:6.3f} {m['mrr']:6.3f} {m['ast_block_hits']:7d}")
+    base, cast = out["whole-symbol"], out["cAST(+blocks)"]
+    held = all(cast[k] >= base[k] - _EPS for k in ("p1", "p3", "p5", "mrr"))
+    print(f"\n  cAST holds whole-symbol precision/MRR: {held}")
+    print("  READ: bar is no-regression here (symbol-shaped gold); the sub-block recall win "
+          "needs a sub-block gold set + large-repo tasks (the named remaining half).")
+    return out
+
+
 def perquery(repo: str = ".", gold=None) -> None:
     """Per-query rank + top-1 ref — for diffing two index states (e.g. heuristic vs
     enriched) to see exactly which query moved."""
@@ -726,6 +766,9 @@ if __name__ == "__main__":
     ap.add_argument("--baselines", action="store_true",
                     help="#9 channel-isolation baselines: hybrid vs symbol/keyword/vector-only "
                          "(RETRIEVAL ranking only — not the token-at-scale win)")
+    ap.add_argument("--cast", action="store_true",
+                    help="cAST subchunking A/B: whole-symbol vs +ast_block children (real "
+                         "model; re-indexes the repo; separate from --gate)")
     ap.add_argument("--tasks", default=None,
                     help="path to an external task set (JSON/YAML) for run/baselines against "
                          "ANY indexed repo; pair with --repo (the large-repo / cross-file set)")
@@ -743,6 +786,8 @@ if __name__ == "__main__":
         perquery(args.repo, gold=gold)
     elif args.baselines:
         baselines(args.repo, gold=gold)
+    elif args.cast:
+        cast_eval(args.repo)
     elif args.brief:
         brief_eval(args.repo)
     elif args.cpp:

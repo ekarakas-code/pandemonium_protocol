@@ -44,9 +44,11 @@ def build_server(settings, embedder=None):
     def repo_get(ref: str, expand: str = "exact", view: str = "full") -> str:
         """Fetch exact code for a stable ref from repo_search (e.g. `path::Qualified.Name`).
         Edit-stable: symbol refs are re-found by name in the live file. expand widens =
-        exact | neighbors | file | parent (default exact; widen only when needed). view
-        narrows to save tokens = full | signature | head:N | lines:a-b — use 'signature'
-        when you only need a symbol's shape, not its body."""
+        exact | neighbors | file | parent (default exact; widen only when needed). A partial
+        ast_block child auto-upgrades to its complete parent symbol — pass expand="block" to
+        get just the raw block instead (flagged not-safe-to-reason-from-alone). view narrows
+        to save tokens = full | signature | head:N | lines:a-b — use 'signature' when you only
+        need a symbol's shape, not its body."""
         return ctx.repo_get(ref, expand=expand, view=view)
 
     @mcp.tool()

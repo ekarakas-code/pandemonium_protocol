@@ -27,6 +27,14 @@ dist/
 build/
 target/
 out/
+# Flutter/Dart build + vendored native deps (CocoaPods can be thousands of .h/.cc files).
+.dart_tool/
+.symlinks/
+.plugin_symlinks/
+.fvm/
+ephemeral/
+Pods/
+Carthage/
 __pycache__/
 .pytest_cache/
 .mypy_cache/

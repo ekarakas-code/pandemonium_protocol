@@ -11,9 +11,19 @@ def test_ref_roundtrip():
     assert refs.build_ref("a.py", "symbol", "C.m") == "a.py::C.m"
     assert refs.build_ref("a.py", "file") == "a.py"
     assert refs.build_ref("a.py", "code", start_line=10, end_line=20) == "a.py:10-20"
-    assert refs.parse_ref("a.py::C.m") == ("a.py", "C.m", None)
-    assert refs.parse_ref("a.py:10-20") == ("a.py", None, (10, 20))
-    assert refs.parse_ref("a.py") == ("a.py", None, None)
+    assert refs.parse_ref("a.py::C.m") == ("a.py", "C.m", None, None)
+    assert refs.parse_ref("a.py:10-20") == ("a.py", None, (10, 20), None)
+    assert refs.parse_ref("a.py") == ("a.py", None, None, None)
+
+
+def test_ref_block_roundtrip():
+    """cAST: a `#block:` child ref builds and round-trips, and parse_ref strips the suffix so
+    the qualified name stays the PARENT symbol (the auto-upgrade target)."""
+    ref = refs.build_ref("a.py", "symbol", "C.approve", block_name="validate")
+    assert ref == "a.py::C.approve#block:validate"
+    assert refs.parse_ref(ref) == ("a.py", "C.approve", None, "validate")
+    # A legacy symbol ref is unaffected (block_name None).
+    assert refs.parse_ref("a.py::C.approve") == ("a.py", "C.approve", None, None)
 
 
 def test_get_exact_resolves_symbol(indexed):

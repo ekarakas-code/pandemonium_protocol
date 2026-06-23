@@ -103,9 +103,15 @@ class ContextPacker:
                 f"`{r.symbol_name}` (L{r.start_line}-{r.end_line})" for r in symbols[:6])
             lines.append(f"Symbols: {sym}")
 
-        excerpt = (top.content or "")[:max_chunk_chars]
-        lang = top.language or ""
-        lines.append(f"```{lang}\n{excerpt}\n```")
+        # cAST guard: never excerpt a partial `ast_block` child alone — substitute its
+        # complete parent symbol's body so the pack always shows a whole reasoning unit.
+        excerpt_text, lang = top.content or "", top.language or ""
+        if not top.is_complete_unit and top.parent_ref:
+            prow = self.retriever.sqlite.chunk_by_ref(self.retriever.repo_id, top.parent_ref)
+            if prow is not None and prow["content"]:
+                excerpt_text = prow["content"]
+                lang = prow["language"] or lang
+        lines.append(f"```{lang}\n{excerpt_text[:max_chunk_chars]}\n```")
         return "\n".join(lines)
 
     def close(self) -> None:

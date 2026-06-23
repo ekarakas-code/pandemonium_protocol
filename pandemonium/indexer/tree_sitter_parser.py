@@ -31,6 +31,20 @@ class ParsedSymbol:
 
 
 @dataclass
+class AstBlock:
+    """A block-complete child of a large symbol body (cAST subchunking, Improvements4 #3).
+    Spans a complete AST node (an `if`/`for`/`try`/... statement) or a contiguous run of
+    sibling simple-statements — NEVER a mid-statement cut, so a child is always safe to read
+    as a unit. Lines are 1-based inclusive; `slug` is a stable, byte-derived block name."""
+
+    slug: str
+    start_line: int
+    end_line: int
+    unit_kind: str  # "block" (a compound statement) | "statements" (a simple-statement run)
+    self_contained: bool
+
+
+@dataclass
 class _Def:
     symbol_type: str
     container: bool = False   # pushes a qualified-name scope
@@ -180,6 +194,46 @@ _BODY_NODE_TYPES = {
     "declaration_list", "field_declaration_list", "class_body", "enum_body",
     "enum_member_declaration_list", "interface_body", "object_type", "extension_body",
 }
+
+# --- cAST subchunking (Improvements4 #3) --------------------------------------
+# Languages whose function bodies we split into block-complete children. Custom-parser langs
+# (dart/html/css) and non-parseable langs are excluded — they have no recursable function
+# body in this extractor; they keep the whole-symbol card only.
+_SUBCHUNK_LANGS = {"python", "cpp", "c_sharp", "javascript", "typescript", "tsx"}
+
+# Function-body node types (a subset of _BODY_NODE_TYPES) — the body we walk for blocks.
+# Container bodies (class_body / declaration_list / ...) are intentionally excluded.
+_FUNC_BODY_TYPES = {"block", "statement_block", "function_body", "compound_statement"}
+
+# Per-language compound-statement node types: each becomes one block-complete child; other
+# (simple) statements are grouped into contiguous runs between them.
+_BLOCK_NODE_TYPES: Dict[str, set] = {
+    "python": {"if_statement", "for_statement", "while_statement", "try_statement",
+               "with_statement", "match_statement"},
+    "javascript": {"if_statement", "for_statement", "for_in_statement", "while_statement",
+                   "do_statement", "try_statement", "switch_statement"},
+    "cpp": {"if_statement", "for_statement", "for_range_loop", "while_statement",
+            "do_statement", "try_statement", "switch_statement"},
+    "c_sharp": {"if_statement", "for_statement", "for_each_statement", "while_statement",
+                "do_statement", "try_statement", "switch_statement", "using_statement",
+                "lock_statement"},
+}
+_BLOCK_NODE_TYPES["typescript"] = _BLOCK_NODE_TYPES["javascript"]
+_BLOCK_NODE_TYPES["tsx"] = _BLOCK_NODE_TYPES["javascript"]
+
+# Keyword slug prefix for each compound node type.
+_BLOCK_KEYWORD = {
+    "if_statement": "if", "for_statement": "for", "for_in_statement": "for",
+    "for_each_statement": "for", "for_range_loop": "for", "while_statement": "while",
+    "do_statement": "do", "try_statement": "try", "with_statement": "with",
+    "switch_statement": "switch", "using_statement": "using", "lock_statement": "lock",
+    "match_statement": "match",
+}
+
+_IDENT_TYPES = {"identifier", "field_identifier", "type_identifier", "property_identifier",
+                "shorthand_property_identifier", "scoped_identifier"}
+_BLOCK_COMMENT_TYPES = {"comment", "line_comment", "block_comment"}
+_MIN_BLOCK_LINES = 3
 
 
 def _signature(src: bytes, node) -> str:
@@ -348,6 +402,134 @@ def parse_symbols(source: bytes, language: str) -> List[ParsedSymbol]:
     return symbols
 
 
+# --- cAST block extraction (Improvements4 #3) --------------------------------
+def _first_identifier(src: bytes, node, limit_byte: int) -> Optional[str]:
+    """First identifier token in `node` (pre-order) starting before limit_byte — i.e. in the
+    statement's HEADER, not its body. None when the header carries no identifier (bare `try:`)."""
+    for c in node.children:
+        if c.start_byte >= limit_byte:
+            break
+        if c.type in _IDENT_TYPES:
+            return _text(src, c)
+        found = _first_identifier(src, c, limit_byte)
+        if found:
+            return found
+    return None
+
+
+def _slugify(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    out = "".join(ch.lower() if ch.isalnum() else "-" for ch in text)
+    return "-".join(p for p in out.split("-") if p)[:40]
+
+
+def _body_limit_byte(node) -> int:
+    """Byte offset where `node`'s own body starts, so naming reads only the header."""
+    for c in node.children:
+        if c.type in _FUNC_BODY_TYPES:
+            return c.start_byte
+    return node.end_byte
+
+
+def _block_slug(src: bytes, node) -> str:
+    kw = _BLOCK_KEYWORD.get(node.type, "block")
+    ident = _slugify(_first_identifier(src, node, _body_limit_byte(node)))
+    return f"{kw}-{ident}" if ident else kw
+
+
+def _run_slug(src: bytes, first_stmt) -> str:
+    if first_stmt.type.startswith("return"):
+        return "return"
+    ident = _slugify(_first_identifier(src, first_stmt, first_stmt.end_byte))
+    return ident or "stmt"
+
+
+def _func_body_node(root, symbol_start: int, symbol_end: int):
+    """The outermost function-body node fully inside [symbol_start, symbol_end] (1-based)."""
+    best = None
+    best_key = None
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type in _FUNC_BODY_TYPES:
+            s, e = n.start_point[0] + 1, n.end_point[0] + 1
+            if s >= symbol_start and e <= symbol_end:
+                key = (s, -e)  # smallest start, then largest end == outermost body
+                if best_key is None or key < best_key:
+                    best, best_key = n, key
+        stack.extend(n.children)
+    return best
+
+
+def extract_symbol_blocks(source: bytes, language: str, symbol_start: int,
+                          symbol_end: int, min_lines: int = 60) -> List[AstBlock]:
+    """Block-complete children of a large symbol body (cAST). Returns [] when the language is
+    not subchunkable, the symbol is <= min_lines, the body can't be located, or fewer than two
+    blocks result (the full-symbol card alone suffices). Each child is a complete AST node or a
+    run of complete sibling statements — never a mid-statement cut."""
+    if language not in _SUBCHUNK_LANGS:
+        return []
+    if symbol_end - symbol_start + 1 <= min_lines:
+        return []
+    try:
+        tree = _get_parser(language).parse(source)
+    except Exception:
+        return []
+    body = _func_body_node(tree.root_node, symbol_start, symbol_end)
+    if body is None:
+        return []
+    block_types = _BLOCK_NODE_TYPES.get(language, set())
+
+    # Partition the body's named children (source order): each compound statement is its own
+    # block; maximal runs of other statements group together.
+    segments: List[AstBlock] = []
+    run_nodes: list = []
+
+    def flush_run() -> None:
+        stmts = [n for n in run_nodes if n.type not in _BLOCK_COMMENT_TYPES]
+        if stmts:
+            s = run_nodes[0].start_point[0] + 1
+            e = run_nodes[-1].end_point[0] + 1
+            segments.append(AstBlock(_run_slug(source, stmts[0]), s, e, "statements", False))
+        run_nodes.clear()
+
+    for child in body.named_children:
+        if child.type in block_types:
+            flush_run()
+            segments.append(AstBlock(_block_slug(source, child), child.start_point[0] + 1,
+                                     child.end_point[0] + 1, "block", True))
+        else:
+            run_nodes.append(child)
+    flush_run()
+
+    # Fold sub-threshold segments into a neighbour so no child is trivially short.
+    merged: List[AstBlock] = []
+    for seg in segments:
+        if seg.end_line - seg.start_line + 1 < _MIN_BLOCK_LINES and merged:
+            prev = merged[-1]
+            merged[-1] = AstBlock(prev.slug, prev.start_line, seg.end_line, prev.unit_kind,
+                                  prev.self_contained and seg.self_contained)
+        else:
+            merged.append(seg)
+    if len(merged) >= 2 and merged[0].end_line - merged[0].start_line + 1 < _MIN_BLOCK_LINES:
+        head, nxt = merged[0], merged[1]
+        merged[1] = AstBlock(nxt.slug, head.start_line, nxt.end_line, nxt.unit_kind,
+                             head.self_contained and nxt.self_contained)
+        merged.pop(0)
+    if len(merged) < 2:
+        return []
+
+    # Disambiguate duplicate slugs by source-order ordinal (stable across unchanged bytes).
+    seen: Dict[str, int] = {}
+    out: List[AstBlock] = []
+    for seg in merged:
+        seen[seg.slug] = seen.get(seg.slug, 0) + 1
+        slug = seg.slug if seen[seg.slug] == 1 else f"{seg.slug}-{seen[seg.slug]}"
+        out.append(AstBlock(slug, seg.start_line, seg.end_line, seg.unit_kind, seg.self_contained))
+    return out
+
+
 # --- Custom extractors for irregular grammars (dart / html / css) ------------
 def _child_of_type(node, *types):
     for c in node.children:
@@ -480,6 +662,8 @@ def _parse_dart(source: bytes) -> List[ParsedSymbol]:
                 nxt = kids[i + 1] if i + 1 < len(kids) else None
                 body = nxt if (nxt is not None and nxt.type == "function_body") else None
                 emit_func(child, body, stack, in_class)
+            elif t == "function_body":
+                continue  # a sig's body; Dart locals are intentionally NOT recursed (docstring)
             else:
                 walk(child, stack, in_class)
 

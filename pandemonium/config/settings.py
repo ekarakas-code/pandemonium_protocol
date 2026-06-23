@@ -43,10 +43,13 @@ DEFAULTS: dict[str, Any] = {
     },
     "indexing": {
         # chunk_min_lines / chunk_max_tokens: NOT read yet — RESERVED for the token-aware
-        # chunking bet (IMPROVEMENTS.md "Bigger bets"). Chunking is line-window today
-        # (build_chunks window_lines=60 / overlap=10, hardcoded in index_runner).
+        # chunking bet (IMPROVEMENTS.md "Bigger bets").
         "chunk_min_lines": 5,
         "chunk_max_tokens": 512,
+        # cAST subchunking (Improvements4 #3): a parsed symbol longer than this many lines is
+        # ALSO split into block-complete `ast_block` children (the full symbol is always kept
+        # as one complete card). Below the threshold a symbol stays a single chunk.
+        "subchunk_min_lines": 60,
         # include_tests: NOT read (vestigial) — test files are always scanned + indexed.
         "include_tests": True,
         # incremental: NOT read — the incremental/full choice is the `--full` CLI flag

@@ -61,6 +61,8 @@ def _next_move(r: SearchResult, low_confidence: bool) -> str:
     the impact-first default; low-confidence cards point at verification instead."""
     if low_confidence:
         return "repo_get(ref) to verify — low-confidence result, don't anchor on it"
+    if not r.is_complete_unit and r.parent_ref:
+        return f"repo_get(ref) — partial block; auto-expands to complete unit {r.parent_ref}"
     is_symbol = (r.scope == "symbol") or (r.chunk_type in _EDITABLE_SCOPES)
     if is_symbol:
         return "repo_get(ref) to read; repo_impact(ref) before editing it"
@@ -79,7 +81,8 @@ def _format_results(results: List[SearchResult], assessment=None) -> str:
     low = bool(assessment and assessment.get("confidence") == "low")
     for i, r in enumerate(results, 1):
         ref = r.ref or f"{r.path}:{r.start_line}-{r.end_line}"
-        lines.append(f"{i}. ref={ref} [{r.scope or r.chunk_type}] score={r.score}")
+        partial = "" if r.is_complete_unit else " partial"  # cAST: a sub-block, not a whole unit
+        lines.append(f"{i}. ref={ref} [{r.scope or r.chunk_type}{partial}] score={r.score}")
         if r.summary:
             lines.append(f"   {r.summary}")
         tagline = _format_tagline(r.tags)
@@ -120,6 +123,7 @@ class ToolContext:
         self.session_id = f"mcp-{os.getpid()}"
         self.ledger = SessionLedger.open(settings, self.session_id)
         self._retriever: Optional[Retriever] = None
+        self._graph_index = None  # cached repo-wide GraphIndex; rebuilt only after a reindex
         self._packer: Optional[ContextPacker] = None
         # A pre-warmed embedder (loaded single-threaded before serving) is reused here so the
         # heavy first `import sentence_transformers` never fires on the event-loop thread
@@ -185,6 +189,17 @@ class ToolContext:
         return self._retriever
 
     @property
+    def graph_index(self):
+        """Repo-wide GraphIndex (name->symbol resolution maps), cached across
+        graph/impact/edit_plan/logic_map/brief calls instead of rebuilt from all_symbols
+        every time. Built once; invalidated by _reset() after a reindex. Self-contained after
+        construction (never reads the store again), so reuse across calls is safe."""
+        if self._graph_index is None:
+            from pandemonium.graph import GraphIndex
+            self._graph_index = GraphIndex(self.retriever.sqlite, self.retriever.repo_id)
+        return self._graph_index
+
+    @property
     def packer(self) -> ContextPacker:
         if self._packer is None:
             self._packer = ContextPacker(self.settings, retriever=self.retriever)
@@ -195,6 +210,7 @@ class ToolContext:
             self._retriever.close()
         self._retriever = None
         self._packer = None
+        self._graph_index = None  # symbols may have changed -> rebuild lazily next use
 
     # -- tools --------------------------------------------------------------
     def repo_map(self, mode: str = "default") -> str:
@@ -218,9 +234,14 @@ class ToolContext:
         self.audit.log("mcp_tool", tool="repo_get", ref=ref, expand=expand, view=view)
         self.ledger.record_fetch(ref)
         from pandemonium import refs
-        row = self.retriever.sqlite.chunk_by_ref(self.retriever.repo_id, ref)
-        resolved = refs.resolve_from_row(self.settings.repo_root, ref, row,
-                                         expand=expand, view=view)
+        repo_id = self.retriever.repo_id
+        row = self.retriever.sqlite.chunk_by_ref(repo_id, ref)
+        # cAST delivery contract: a partial ast_block child auto-upgrades to its complete
+        # parent (expand="block" opts out) so the agent never reasons from half a unit.
+        resolved = refs.resolve_with_upgrade(
+            self.settings.repo_root, ref, row,
+            fetch_row=lambda r: self.retriever.sqlite.chunk_by_ref(repo_id, r),
+            expand=expand, view=view)
         if resolved is None:
             return f"Could not resolve ref: {ref}"
         view_note = "" if resolved.view in ("full", None) else f" view={resolved.view}"
@@ -234,6 +255,8 @@ class ToolContext:
             notes.append("ambiguous: multiple symbols share this name; best-effort pick")
         if resolved.resolved_by == "fingerprint":
             notes.append("re-found by body after a likely rename — the ref name is outdated")
+        if resolved.note:
+            notes.append(resolved.note)
         if notes:
             head += "  (" + "; ".join(notes) + ")"
         if resolved.decl_ref:  # C++ out-of-line def: also declared in a sibling header
@@ -297,7 +320,7 @@ class ToolContext:
     def repo_graph(self, ref: str, evidence: bool = False) -> str:
         self.audit.log("mcp_tool", tool="repo_graph", ref=ref, evidence=evidence)
         from pandemonium.graph import render_graph, repo_graph
-        g = repo_graph(self.settings, ref)
+        g = repo_graph(self.settings, ref, graph=self.graph_index)
         if g:  # remember confidently-resolved edges ("A -> B" == A calls B)
             self.ledger.record_edges(
                 [f"{g['ref']} -> {c['ref']}" for c in g.get("callees", [])]
@@ -307,7 +330,7 @@ class ToolContext:
     def repo_impact(self, ref: str) -> str:
         self.audit.log("mcp_tool", tool="repo_impact", ref=ref)
         from pandemonium.graph import render_impact, repo_impact
-        g = repo_impact(self.settings, ref)
+        g = repo_impact(self.settings, ref, graph=self.graph_index)
         if g:  # direct callers are confident edges into this ref
             self.ledger.record_edges([f"{d} -> {g['ref']}" for d in g.get("direct", [])])
         return render_impact(g) if g else f"Ref not found in the graph: {ref}"
@@ -315,7 +338,7 @@ class ToolContext:
     def repo_edit_plan(self, ref: str) -> str:
         self.audit.log("mcp_tool", tool="repo_edit_plan", ref=ref)
         from pandemonium.graph import edit_plan, render_edit_plan
-        p = edit_plan(self.settings, ref)
+        p = edit_plan(self.settings, ref, graph=self.graph_index)
         if p:  # record the confident caller edges, like repo_impact
             self.ledger.record_edges([f"{d} -> {p['ref']}" for d in p["callers_direct"]])
         return render_edit_plan(p) if p else f"Ref not found in the graph: {ref}"
@@ -323,14 +346,14 @@ class ToolContext:
     def repo_logic_map(self, topic: str) -> str:
         self.audit.log("mcp_tool", tool="repo_logic_map", topic=topic)
         from pandemonium.graph import render_logic_map, repo_logic_map
-        g = repo_logic_map(self.settings, topic)
+        g = repo_logic_map(self.settings, topic, graph=self.graph_index)
         return render_logic_map(g) if g else "No matches for that topic."
 
     def repo_brief(self, task: str) -> str:
         self.audit.log("mcp_tool", tool="repo_brief", task=task)
         from pandemonium.brief import render_brief, repo_brief
         # Reuse the shared retriever so the embedding model isn't reloaded per call.
-        b = repo_brief(self.settings, task, retriever=self.retriever)
+        b = repo_brief(self.settings, task, retriever=self.retriever, graph=self.graph_index)
         self.ledger.record_query(task)
         if b.get("anchored") and b.get("verified"):  # record confident caller edges
             v = b["verified"]

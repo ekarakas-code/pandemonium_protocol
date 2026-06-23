@@ -33,7 +33,10 @@ class FtsStore:
 
     def index_chunk(self, chunk_id: str, content: str, summary: str,
                     path: str, symbol_name: str) -> None:
-        self.conn.execute("DELETE FROM chunks_fts WHERE chunk_id=?", (chunk_id,))
+        # No delete-before-insert here: chunk_id is UNINDEXED, so a per-chunk DELETE is a full
+        # FTS-table scan -> O(N^2) over a full index. The caller already purges a file's old
+        # FTS rows via clear_file_derived()/delete_chunks() (and --full wipes the table once
+        # via clear_all()) before re-inserting, so the bare INSERT is sufficient and O(1).
         self.conn.execute(
             "INSERT INTO chunks_fts(chunk_id, content, summary, path, symbol_name) "
             "VALUES(?,?,?,?,?)",
@@ -45,6 +48,13 @@ class FtsStore:
         if ids:
             self.conn.executemany(
                 "DELETE FROM chunks_fts WHERE chunk_id=?", [(i,) for i in ids])
+
+    def clear_all(self) -> None:
+        """Wipe the whole FTS index in one shot (full rebuild). DROP+recreate is ~O(1) vs a
+        per-chunk DELETE which is a full scan each (chunk_id is UNINDEXED). chunks_fts has no
+        repo_id column, but each repo has its own SQLite file, so this is repo-scoped here."""
+        self.conn.execute("DROP TABLE IF EXISTS chunks_fts")
+        self.create_schema()
 
     @staticmethod
     def build_match_query(text: str) -> Optional[str]:

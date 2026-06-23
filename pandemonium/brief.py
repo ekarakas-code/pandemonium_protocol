@@ -238,7 +238,7 @@ def _suggested_action(label: str, anchored: bool, anchor, results, anchor_stale:
             "task needs rephrasing with a more distinctive term.")
 
 
-def repo_brief(settings, task: str, retriever=None) -> dict:
+def repo_brief(settings, task: str, retriever=None, graph=None) -> dict:
     """Compose a trust-separated brief for a freeform task. See module docstring."""
     from pandemonium.graph import edit_plan
     from pandemonium.retrieval.hybrid_search import Retriever
@@ -274,7 +274,7 @@ def repo_brief(settings, task: str, retriever=None) -> dict:
                 and r.symbol_name == anchor.symbol_name)
             if assessment.get("reason") == "exact symbol match" else 1)
 
-        plan = edit_plan(settings, anchor.ref) if anchor is not None else None
+        plan = edit_plan(settings, anchor.ref, graph=graph) if anchor is not None else None
         if anchor is not None and plan is None:
             label, reasons = "low", ["the top candidate didn't resolve in the call graph"]
         else:

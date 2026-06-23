@@ -91,7 +91,12 @@ CREATE TABLE IF NOT EXISTS chunks (
     qualified_name TEXT,
     parent TEXT,
     tags TEXT,
-    decl_ref TEXT
+    decl_ref TEXT,
+    is_complete_unit INTEGER DEFAULT 1,
+    unit_kind TEXT,
+    parent_ref TEXT,
+    requires_parent_header INTEGER DEFAULT 0,
+    requires_imports INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_repo ON chunks(repo_id);
@@ -167,6 +172,8 @@ class SqliteStore:
         self.conn.row_factory = sqlite3.Row
         self._configure()
         self.fts = FtsStore(self.conn)
+        # Memoized symbols_by_name results (read path); cleared on any symbol write below.
+        self._symname_cache: dict = {}
 
     def _configure(self) -> None:
         cur = self.conn.cursor()
@@ -195,9 +202,17 @@ class SqliteStore:
         """Add later-phase columns to pre-existing tables (no-op if already present)."""
         chunk_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(chunks)")}
         for col in ("ref", "scope", "qualified_name", "parent", "tags",
-                    "signature_hash", "fingerprint", "symbol_content_hash", "decl_ref"):
+                    "signature_hash", "fingerprint", "symbol_content_hash", "decl_ref",
+                    "unit_kind", "parent_ref"):
             if col not in chunk_cols:
                 self.conn.execute(f"ALTER TABLE chunks ADD COLUMN {col} TEXT")
+        # cAST completeness flags (Improvements4 #7): INTEGER booleans with defaults so rows
+        # written before the feature read back as complete / self-contained.
+        for col, default in (("is_complete_unit", 1), ("requires_parent_header", 0),
+                             ("requires_imports", 0)):
+            if col not in chunk_cols:
+                self.conn.execute(
+                    f"ALTER TABLE chunks ADD COLUMN {col} INTEGER DEFAULT {default}")
         # Reliability: durable identity discriminants on symbols. decl_ref (Step 8) points an
         # out-of-line C++ definition at its header declaration site.
         sym_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(symbols)")}
@@ -262,6 +277,7 @@ class SqliteStore:
         self.conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
         self.conn.execute("DELETE FROM symbols WHERE file_id=?", (file_id,))
         self.conn.execute("DELETE FROM relationships WHERE file_id=?", (file_id,))
+        self._symname_cache.clear()
         return chunk_ids
 
     def delete_file(self, file_id: str) -> list[str]:
@@ -269,6 +285,17 @@ class SqliteStore:
         chunk_ids = self.clear_file_derived(file_id)
         self.conn.execute("DELETE FROM files WHERE id=?", (file_id,))
         return chunk_ids
+
+    def clear_repo_derived(self, repo_id: str) -> None:
+        """Full-rebuild fast path: wipe ALL derived rows for the repo in one shot. The per-file
+        clear_file_derived() path deletes FTS rows per chunk (each a full scan of the UNINDEXED
+        chunk_id) -> O(N^2) across a --full rebuild; this is O(rows) once. Leaves the `files`
+        table intact (it is upserted per file; truly-gone files are pruned separately)."""
+        self.conn.execute("DELETE FROM chunks WHERE repo_id=?", (repo_id,))
+        self.conn.execute("DELETE FROM symbols WHERE repo_id=?", (repo_id,))
+        self.conn.execute("DELETE FROM relationships WHERE repo_id=?", (repo_id,))
+        self.fts.clear_all()
+        self._symname_cache.clear()
 
     # -- symbols / chunks ---------------------------------------------------
     def insert_symbols(self, symbols: Iterable[Symbol]) -> None:
@@ -282,38 +309,55 @@ class SqliteStore:
               s.signature_hash, s.fingerprint, s.decl_ref)
              for s in symbols],
         )
+        self._symname_cache.clear()
 
-    def insert_chunks(self, chunks: Iterable[Chunk]) -> None:
+    def insert_chunks(self, chunks: Iterable[Chunk],
+                      symbol_names: Optional[dict] = None) -> None:
         chunk_list = list(chunks)
         self.conn.executemany(
             """INSERT OR REPLACE INTO chunks(id, repo_id, file_id, symbol_id, chunk_type,
                    language, path, start_line, end_line, content, summary, content_hash,
                    ref, scope, qualified_name, parent, tags, signature_hash, fingerprint,
-                   symbol_content_hash, decl_ref)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   symbol_content_hash, decl_ref, is_complete_unit, unit_kind, parent_ref,
+                   requires_parent_header, requires_imports)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [(c.id, c.repo_id, c.file_id, c.symbol_id, c.chunk_type, c.language, c.path,
               c.start_line, c.end_line, c.content, c.summary, c.content_hash,
               c.ref, c.scope, c.qualified_name, c.parent,
               json.dumps(c.tags) if c.tags is not None else None,
-              c.signature_hash, c.fingerprint, c.symbol_content_hash, c.decl_ref)
+              c.signature_hash, c.fingerprint, c.symbol_content_hash, c.decl_ref,
+              int(c.is_complete_unit), c.unit_kind, c.parent_ref,
+              int(c.requires_parent_header), int(c.requires_imports))
              for c in chunk_list],
         )
         for c in chunk_list:
-            symbol_name = None
-            if c.symbol_id:
+            if not c.symbol_id:
+                symbol_name = ""
+            elif symbol_names is not None:  # caller-supplied map avoids a SELECT per chunk (N+1)
+                symbol_name = symbol_names.get(c.symbol_id) or ""
+            else:  # back-compat: look it up only if the caller didn't supply the map
                 r = self.conn.execute(
                     "SELECT name FROM symbols WHERE id=?", (c.symbol_id,)).fetchone()
-                symbol_name = r["name"] if r else None
-            self.fts.index_chunk(c.id, c.content, c.summary or "", c.path, symbol_name or "")
+                symbol_name = (r["name"] if r else "") or ""
+            self.fts.index_chunk(c.id, c.content, c.summary or "", c.path, symbol_name)
 
     def commit(self) -> None:
         self.conn.commit()
 
     # -- lookups (retrieval) ------------------------------------------------
     def symbols_by_name(self, repo_id: str, name: str, limit: int = 20) -> list[sqlite3.Row]:
-        """Exact (case-insensitive) first, then prefix, then substring."""
+        """Exact (case-insensitive) first, then prefix, then substring.
+
+        Memoized per (repo_id, name, limit): the substring match uses a leading-wildcard LIKE
+        that can't use the name indexes (full symbols scan), and the fan-out search path
+        re-issues the same lookups up to ~5x per query. The cache is cleared on any symbol
+        write (see insert_symbols / clear_file_derived / clear_repo_derived)."""
+        key = (repo_id, name, limit)
+        cached = self._symname_cache.get(key)
+        if cached is not None:
+            return cached
         like = name.replace("%", r"\%").replace("_", r"\_")
-        return self.conn.execute(
+        rows = self.conn.execute(
             r"""SELECT *, CASE
                     WHEN name = ? COLLATE NOCASE THEN 3
                     WHEN name LIKE ? ESCAPE '\' COLLATE NOCASE THEN 2
@@ -325,6 +369,8 @@ class SqliteStore:
                 LIMIT ?""",
             (name, like + "%", repo_id, "%" + like + "%", "%" + like + "%", limit),
         ).fetchall()
+        self._symname_cache[key] = rows
+        return rows
 
     def chunk_ids_for_symbols(self, symbol_ids: list[str]) -> list[str]:
         if not symbol_ids:

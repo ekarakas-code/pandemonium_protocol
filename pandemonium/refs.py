@@ -38,7 +38,8 @@ from pandemonium.indexer.tree_sitter_parser import ParsedSymbol, parse_symbols
 from pandemonium.util import fingerprint_for, sha256_text, signature_hash_for
 
 _LINE_RE = re.compile(r"^(?P<path>.+):(?P<start>\d+)-(?P<end>\d+)$")
-EXPAND_MODES = ("exact", "neighbors", "file", "parent")
+_BLOCK_RE = re.compile(r"#block:(?P<slug>[A-Za-z0-9._\-]+)$")  # cAST child-block suffix
+EXPAND_MODES = ("exact", "neighbors", "file", "parent", "block")  # "block" handled pre-resolve
 VIEW_FULL = "full"
 _VIEW_LINES_RE = re.compile(r"^lines:(\d+)-(\d+)$")
 _VIEW_HEAD_RE = re.compile(r"^head:(\d+)$")
@@ -59,27 +60,45 @@ class ResolvedCode:
     resolved_by: str = "qname"  # qname | signature | fingerprint | line | file | code
     view: str = VIEW_FULL  # full | signature | head:N | lines:a-b (narrowing, post-expand)
     decl_ref: Optional[str] = None  # C++ header declaration site (Step 8), if merged
+    # cAST completeness (Improvements4 #7): so repo_get never silently serves a partial unit.
+    unit_kind: Optional[str] = None
+    is_complete_unit: bool = True
+    safe_for_reasoning: bool = True  # derived: is_complete_unit
+    parent_ref: Optional[str] = None
+    note: Optional[str] = None  # e.g. auto-upgrade explanation
 
 
 def build_ref(path: str, scope: str, qualified_name: Optional[str] = None,
-              start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+              start_line: Optional[int] = None, end_line: Optional[int] = None,
+              block_name: Optional[str] = None) -> str:
     if scope == "symbol" and qualified_name:
-        return f"{path}::{qualified_name}"
+        base = f"{path}::{qualified_name}"
+        return f"{base}#block:{block_name}" if block_name else base  # cAST child label
     if scope == "file":
         return path
     return f"{path}:{start_line}-{end_line}"
 
 
-def parse_ref(ref: str) -> Tuple[str, Optional[str], Optional[Tuple[int, int]]]:
-    """Return (path, qualified_name | None, (start, end) | None)."""
+def parse_ref(ref: str) -> Tuple[str, Optional[str], Optional[Tuple[int, int]], Optional[str]]:
+    """Return (path, qualified_name | None, (start, end) | None, block_name | None).
+
+    cAST: a `#block:<slug>` suffix is stripped FIRST (before the `::`/line parsing — otherwise
+    it would corrupt the qualified name). A `path::Qual.fn#block:slug` ref therefore parses to
+    the PARENT symbol `Qual.fn` plus the slug, so resolve() degrades it to the complete parent
+    (which is the auto-upgrade target anyway). The block slug is informational here."""
     ref = ref.strip()
+    block_name = None
+    bm = _BLOCK_RE.search(ref)
+    if bm:
+        block_name = bm.group("slug")
+        ref = ref[:bm.start()]
     if "::" in ref:
         path, qname = ref.split("::", 1)
-        return path, qname, None
+        return path, qname, None, block_name
     m = _LINE_RE.match(ref)
     if m:
-        return m.group("path"), None, (int(m.group("start")), int(m.group("end")))
-    return ref, None, None  # whole-file ref
+        return m.group("path"), None, (int(m.group("start")), int(m.group("end"))), block_name
+    return ref, None, None, block_name  # whole-file ref
 
 
 def _read_lines(repo_root: Path, rel_path: str) -> Optional[List[str]]:
@@ -178,7 +197,7 @@ def resolve(repo_root, ref: str, expand: str = "exact", neighbor_lines: int = 8,
     span's hash), the result's `stale` reflects an actual content change, not just
     name-presence. The hash args come from the stored card via `chunk_by_ref`."""
     repo_root = Path(repo_root)
-    path, qname, line_range = parse_ref(ref)
+    path, qname, line_range, _block = parse_ref(ref)
     lines = _read_lines(repo_root, path)
     if lines is None:
         return None  # file gone / unreadable
@@ -266,6 +285,46 @@ def resolve_from_row(repo_root, ref: str, row, expand: str = "exact",
     # can't be re-derived by resolve()'s single-file re-parse — carry it from the stored row.
     if resolved is not None:
         resolved.decl_ref = col("decl_ref")
+        _apply_completeness(resolved, row)
+    return resolved
+
+
+def _apply_completeness(resolved: ResolvedCode, row) -> None:
+    """Copy the cAST completeness columns from the stored card onto the resolved code, and
+    derive safe_for_reasoning (a complete unit is safe; a partial child/header/preview is not).
+    Defaults keep legacy rows (no columns) complete + safe."""
+    def col(name):
+        return row[name] if row is not None and name in row.keys() else None
+    ic = col("is_complete_unit")
+    resolved.is_complete_unit = True if ic is None else bool(ic)
+    resolved.unit_kind = col("unit_kind")
+    resolved.parent_ref = col("parent_ref")
+    resolved.safe_for_reasoning = resolved.is_complete_unit
+
+
+def resolve_with_upgrade(repo_root, ref: str, row, fetch_row, expand: str = "exact",
+                         view: str = VIEW_FULL) -> Optional[ResolvedCode]:
+    """The delivery contract (Improvements4 #4): resolve `ref`, but if it lands on a partial
+    cAST child (an `ast_block`, is_complete_unit=False) auto-upgrade to its COMPLETE parent so
+    the agent never reasons from half a unit. `fetch_row(parent_ref) -> row` is the storage
+    callback (keeps this storage-agnostic). `expand="block"` opts OUT and returns the raw child
+    (still flagged unsafe). Other expand modes pass through unchanged."""
+    raw = expand == "block"
+    resolved = resolve_from_row(repo_root, ref, row, expand=("exact" if raw else expand),
+                                view=view)
+    if resolved is None:
+        return None
+    if not raw and not resolved.is_complete_unit and resolved.parent_ref:
+        prow = fetch_row(resolved.parent_ref)
+        parent = resolve_from_row(repo_root, resolved.parent_ref, prow, expand="exact",
+                                  view=view)
+        if parent is not None:
+            parent.note = (f"auto-expanded from partial block {ref} to complete unit "
+                           f"{resolved.parent_ref}")
+            return parent
+    if not resolved.is_complete_unit:
+        tail = f" (parent: {resolved.parent_ref})" if resolved.parent_ref else ""
+        resolved.note = f"partial unit ({resolved.unit_kind}) — not safe to reason from alone{tail}"
     return resolved
 
 
