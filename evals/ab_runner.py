@@ -157,6 +157,18 @@ def reindex(work: Path):
     return r.returncode == 0, (r.stdout or "")[-300:] + (r.stderr or "")[-300:]
 
 
+def enable_rerank(work: Path) -> None:
+    """Arm C: turn ON the Patch 4/5 structural reranker in the work copy's config, so the served
+    MCP retrieval applies it. (Arm B leaves the default OFF.) Merges into the existing
+    `retrieval:` section so the other tuned keys are preserved."""
+    import yaml
+    p = work / "pandemonium.yaml"
+    data = (yaml.safe_load(p.read_text(encoding="utf-8")) if p.exists() else {}) or {}
+    r = data.setdefault("retrieval", {})
+    r["rerank"], r["rerank_prose"], r["rerank_density"] = True, True, True
+    p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
 def write_mcp(work: Path) -> Path:
     cfg = {"mcpServers": {"pandemonium": {"command": str(PANDE),
             "args": ["serve-mcp", "--repo", str(work)]}}}
@@ -168,7 +180,7 @@ def write_mcp(work: Path) -> Path:
 def run_agent(work: Path, prompt: str, arm: str):
     args = [CLAUDE, "-p", prompt, "--output-format", "json", "--model", AGENT_MODEL,
             "--dangerously-skip-permissions", "--max-turns", str(MAX_TURNS)]
-    if arm == "B":
+    if arm in ("B", "C"):
         args += ["--mcp-config", str(write_mcp(work)), "--strict-mcp-config",
                  "--append-system-prompt", armb_system()]
     else:
@@ -216,18 +228,21 @@ def diff_of(work: Path, mutations=()) -> str:
     return ("".join(chunks))[:4000] or "(no change vs the buggy baseline)"
 
 
-def judge(task, diff_a, diff_b):
-    order = [("A", diff_a), ("B", diff_b)]
+def judge(task, diffs: dict):
+    """Blind-score N candidate fixes (arm -> diff) in one Opus call; shuffled so arm identity
+    is hidden. Returns {score_<arm>: 1-5, winner: <arm>, why}."""
+    order = list(diffs.items())
     random.shuffle(order)
+    sols = "\n\n".join(f"=== SOLUTION {i + 1} (diff) ===\n{d}" for i, (_a, d) in enumerate(order))
+    slots = ", ".join(["<1-5>"] * len(order))
     prompt = (
-        "You are grading two candidate fixes for the same coding task, blind. Score each on "
+        "You are grading candidate fixes for the SAME coding task, blind. Score each on "
         "correctness and quality (1=wrong/harmful, 5=correct, minimal, idiomatic). You have "
         "EVERYTHING you need in the diffs below — do NOT use any tools, do not read files; "
         "judge only from what is shown.\n\n"
-        f"TASK:\n{task['prompt']}\n\n=== SOLUTION 1 (diff) ===\n{order[0][1]}\n\n"
-        f"=== SOLUTION 2 (diff) ===\n{order[1][1]}\n\n"
-        'Reply with ONLY a JSON object (no prose): {"s1": <1-5>, "s2": <1-5>, '
-        '"winner": "1"|"2"|"tie", "why": "<one sentence>"}'
+        f"TASK:\n{task['prompt']}\n\n{sols}\n\n"
+        f'Reply with ONLY a JSON object (no prose): {{"scores": [{slots}], '
+        '"winner": <1-based index of the best>, "why": "<one sentence>"}'
     )
     # Forbid tools (so the judge can't peek at the real repo and can't burn turns tool-calling)
     # and run in a neutral cwd. A small max-turns buffer covers a stray tool attempt.
@@ -240,11 +255,15 @@ def judge(task, diff_a, diff_b):
         raw = json.loads(r.stdout).get("result", "") or ""
         m = re.search(r"\{.*\}", raw, re.DOTALL)  # tolerate prose around the JSON
         ans = json.loads(m.group(0))
-        mp = {"1": order[0][0], "2": order[1][0]}
-        sc = {order[0][0]: ans.get("s1"), order[1][0]: ans.get("s2")}
-        win = mp.get(str(ans.get("winner")), ans.get("winner"))
-        return {"score_A": sc.get("A"), "score_B": sc.get("B"), "winner": win,
-                "why": ans.get("why", "")}
+        scores = ans.get("scores", [])
+        out = {f"score_{a}": (scores[i] if i < len(scores) else None)
+               for i, (a, _d) in enumerate(order)}
+        try:
+            out["winner"] = order[int(ans.get("winner")) - 1][0]
+        except Exception:
+            out["winner"] = None
+        out["why"] = ans.get("why", "")
+        return out
     except Exception as e:
         return {"error": f"{e!r}", "raw": (raw or r.stdout or r.stderr or "")[:300]}
 
@@ -273,8 +292,9 @@ def validate(tasks):
 
 
 def run_pair(task, rep):
-    """One (task, repeat): run both arms (shuffled order), grade, judge. Returns rows."""
-    arms = ["A", "B"]
+    """One (task, repeat): run all 3 arms (shuffled order) — A=vanilla, B=protocol,
+    C=protocol+rerank — grade, blind-judge. Returns rows."""
+    arms = ["A", "B", "C"]
     random.shuffle(arms)
     out = {}
     diffs = {}
@@ -282,8 +302,10 @@ def run_pair(task, rep):
         work = RUNS / f"{task['id']}_r{rep}_{arm}"
         make_copy(work)
         apply_mutations(work, task["mutations"])
+        if arm == "C":
+            enable_rerank(work)
         idx_note = None
-        if arm == "B":
+        if arm in ("B", "C"):
             idx_ok, idx_note = reindex(work)
             log(f"    [{task['id']} r{rep} {arm}] reindex ok={idx_ok}")
         rec = run_agent(work, task["prompt"], arm)
@@ -297,10 +319,10 @@ def run_pair(task, rep):
         log(f"    [{task['id']} r{rep} {arm}] green={green} cost=${rec['cost_usd']} "
             f"turns={rec['num_turns']} wall={rec['wall_s']}s")
         shutil.rmtree(work, ignore_errors=True)
-    verdict = judge(task, diffs["A"], diffs["B"])
-    out["A"]["judge"] = verdict
-    out["B"]["judge"] = verdict
-    return [out["A"], out["B"]]
+    verdict = judge(task, diffs)
+    for arm in out:
+        out[arm]["judge"] = verdict
+    return [out[a] for a in ("A", "B", "C") if a in out]
 
 
 def main():
@@ -338,59 +360,65 @@ def _mean(xs):
     return round(sum(xs) / len(xs), 4) if xs else None
 
 
+def _tot(r):
+    return r["in_tok"] + r["out_tok"] + r["cache_read"] + r["cache_create"]
+
+
 def report(rows):
-    A = [r for r in rows if r["arm"] == "A"]
-    B = [r for r in rows if r["arm"] == "B"]
+    ARMS = ["A", "B", "C"]
+    LABEL = {"A": "vanilla", "B": "protocol", "C": "protocol+rerank"}
+    byarm = {a: [r for r in rows if r["arm"] == a] for a in ARMS}
     by = {}
     for r in rows:
         by.setdefault((r["task"], r["rep"]), {})[r["arm"]] = r
-    cost_delta, tok_delta = [], []
-    a_wins = b_wins = ties = 0
-    for (_, _), pair in by.items():
-        if "A" in pair and "B" in pair:
-            if pair["A"]["cost_usd"] and pair["B"]["cost_usd"]:
-                cost_delta.append(pair["B"]["cost_usd"] - pair["A"]["cost_usd"])
-            ta = (pair["A"]["in_tok"] + pair["A"]["out_tok"] + pair["A"]["cache_read"] + pair["A"]["cache_create"])
-            tb = (pair["B"]["in_tok"] + pair["B"]["out_tok"] + pair["B"]["cache_read"] + pair["B"]["cache_create"])
-            tok_delta.append(tb - ta)
-            w = (pair["A"].get("judge") or {}).get("winner")
-            a_wins += w == "A"; b_wins += w == "B"; ties += w == "tie"
 
     def passrate(rs):
-        g = [r for r in rs if r["suite_green"]]
-        return f"{len(g)}/{len(rs)}"
+        return f"{sum(1 for r in rs if r['suite_green'])}/{len(rs)}" if rs else "0/0"
 
     lines = [
-        "# Claude Code vs PandemoniumProtocol — A/B results", "",
-        f"Agent model: {AGENT_MODEL} | Judge: {JUDGE_MODEL} | runs: {len(rows)}", "",
-        "## Headline (paired, B = with protocol)", "",
-        f"- Mean cost/task: A=${_mean([r['cost_usd'] for r in A])}  B=${_mean([r['cost_usd'] for r in B])}",
-        f"- Mean cost delta (B-A), paired: ${_mean(cost_delta)}  (negative = protocol cheaper)",
-        f"- Mean total-token delta (B-A), paired: {_mean(tok_delta)}",
-        f"- Mean turns: A={_mean([r['num_turns'] for r in A])}  B={_mean([r['num_turns'] for r in B])}",
-        "",
-        "## Quality (noisy at this N — do not over-read)", "",
-        f"- Test-suite green (fixed + no regression): A={passrate(A)}  B={passrate(B)}",
-        f"- Blind judge wins: A={a_wins}  B={b_wins}  tie={ties}",
-        "",
-        "## Token breakdown (mean per run)", "",
-        f"- A: in={_mean([r['in_tok'] for r in A])} out={_mean([r['out_tok'] for r in A])} "
-        f"cache_create={_mean([r['cache_create'] for r in A])} cache_read={_mean([r['cache_read'] for r in A])}",
-        f"- B: in={_mean([r['in_tok'] for r in B])} out={_mean([r['out_tok'] for r in B])} "
-        f"cache_create={_mean([r['cache_create'] for r in B])} cache_read={_mean([r['cache_read'] for r in B])}",
-        "  (Arm B carries a fixed cache_create tax from ~14 extra MCP tool schemas every run;",
-        "   its benefit is variable — fewer whole-file reads. On a small repo the tax can exceed savings.)",
-        "",
-        "## Per task", "",
+        "# Claude Code A/B/C — vanilla vs protocol vs protocol+rerank", "",
+        f"Agent: {AGENT_MODEL} | Judge: {JUDGE_MODEL} | runs: {len(rows)}", "",
+        "## Per-arm means", "",
+        f"  {'arm':18s}{'green':>8}{'cost$':>10}{'tot_tok':>11}{'turns':>7}{'wall_s':>8}",
     ]
+    for a in ARMS:
+        rs = byarm[a]
+        if not rs:
+            continue
+        lines.append(
+            f"  {LABEL[a]:18s}{passrate(rs):>8}{str(_mean([r['cost_usd'] for r in rs])):>10}"
+            f"{str(_mean([_tot(r) for r in rs])):>11}{str(_mean([r['num_turns'] for r in rs])):>7}"
+            f"{str(_mean([r['wall_s'] for r in rs])):>8}")
+
+    lines += ["", "## Paired deltas (negative = cheaper)", ""]
+    for hi, lo in (("B", "A"), ("C", "B"), ("C", "A")):
+        cds, tds = [], []
+        for pair in by.values():
+            if hi in pair and lo in pair:
+                if pair[hi]["cost_usd"] and pair[lo]["cost_usd"]:
+                    cds.append(pair[hi]["cost_usd"] - pair[lo]["cost_usd"])
+                tds.append(_tot(pair[hi]) - _tot(pair[lo]))
+        lines.append(f"  {LABEL[hi]} - {LABEL[lo]}: cost_delta=${_mean(cds)}  tok_delta={_mean(tds)}")
+
+    wins = {}
+    for pair in by.values():
+        j = next((p.get("judge") for p in pair.values() if p.get("judge")), None) or {}
+        if j.get("winner"):
+            wins[j["winner"]] = wins.get(j["winner"], 0) + 1
+    lines += ["", "## Quality (noisy at small N — do not over-read)", "",
+              f"- suite-green per arm: " + "  ".join(f"{LABEL[a]}={passrate(byarm[a])}" for a in ARMS if byarm[a]),
+              f"- blind judge wins (by arm): {wins}",
+              "  (Arm B/C pay a fixed cache_create tax from the extra MCP tool schemas every run;",
+              "   the benefit is variable — fewer whole-file reads. On a small repo the tax can exceed it.)",
+              "", "## Per run", ""]
     for (task, rep), pair in sorted(by.items()):
-        for arm in ("A", "B"):
-            r = pair.get(arm)
+        for a in ARMS:
+            r = pair.get(a)
             if r:
                 j = r.get("judge") or {}
-                lines.append(f"- {task} r{rep} {arm}: green={r['suite_green']} "
+                lines.append(f"- {task} r{rep} {LABEL[a]}: green={r['suite_green']} "
                              f"cost=${r['cost_usd']} turns={r['num_turns']} "
-                             f"score={j.get('score_'+arm)} wall={r['wall_s']}s")
+                             f"tot_tok={_tot(r)} score={j.get('score_' + a)} wall={r['wall_s']}s")
     (BENCH / "report.md").write_text("\n".join(str(x) for x in lines), encoding="utf-8")
     log(f"REPORT written -> {BENCH / 'report.md'}")
     print("\n".join(str(x) for x in lines))
