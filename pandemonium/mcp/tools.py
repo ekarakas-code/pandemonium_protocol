@@ -276,7 +276,7 @@ class ToolContext:
     def repo_reindex_changed(self) -> str:
         self.audit.log("mcp_tool", tool="repo_reindex_changed")
         from pandemonium.indexer.index_runner import run_index
-        stats = run_index(self.settings, incremental=True)
+        stats = run_index(self.settings, incremental=True, compact=False)
         self._reset()  # force stores to reopen so subsequent reads see fresh data
         msg = (f"Reindexed: indexed={stats.indexed} skipped={stats.skipped} "
                f"deleted={stats.deleted} symbols={stats.symbols} chunks={stats.chunks}")
@@ -346,7 +346,7 @@ class ToolContext:
     def repo_logic_map(self, topic: str) -> str:
         self.audit.log("mcp_tool", tool="repo_logic_map", topic=topic)
         from pandemonium.graph import render_logic_map, repo_logic_map
-        g = repo_logic_map(self.settings, topic, graph=self.graph_index)
+        g = repo_logic_map(self.settings, topic, graph=self.graph_index, retriever=self.retriever)
         return render_logic_map(g) if g else "No matches for that topic."
 
     def repo_brief(self, task: str) -> str:

@@ -83,7 +83,7 @@ class AutoReindexer:
         from pandemonium.indexer.index_runner import Indexer
         indexer = Indexer(self.settings, embedder=self.embedder)
         try:
-            stats = indexer.run(incremental=True)
+            stats = indexer.run(incremental=True, compact=False)  # serve-path: can't compact while a reader holds the table
         finally:
             indexer.close()
         self._snapshot = current

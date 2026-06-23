@@ -68,6 +68,28 @@ def get(settings, ref: str, expand: str = "exact", view: str = "full"):
         store.close()
 
 
+def _file_state(abs_path, row) -> str:
+    """State of one indexed file vs disk. Cheap path: if size AND mtime match the stored
+    values it's 'current' WITHOUT reading/hashing the file (the expensive part on big repos);
+    only read+hash when they differ, to confirm the content actually changed."""
+    try:
+        st = abs_path.stat()
+    except OSError:
+        return "missing"
+    if row is None:
+        return "not_indexed"
+    keys = row.keys()
+    stored_mtime = row["mtime"] if "mtime" in keys else None
+    stored_size = row["size_bytes"] if "size_bytes" in keys else None
+    if (stored_mtime and stored_size is not None
+            and st.st_size == stored_size and abs(st.st_mtime - stored_mtime) < 1e-6):
+        return "current"
+    read = read_file(abs_path)
+    if read is None:
+        return "missing"
+    return "current" if read[2] == row["content_hash"] else "changed"
+
+
 def staleness(settings, refs: Optional[List[str]] = None) -> List[dict]:
     """Are the files behind these refs (or all indexed files) changed since indexing?
     Powers repo_changed — 'don't trust a symbol if its file changed after indexing'."""
@@ -75,24 +97,14 @@ def staleness(settings, refs: Optional[List[str]] = None) -> List[dict]:
     store.create_schema()
     repo_id = repo_id_for(settings.repo_root)
     try:
+        stored_by_path = store.all_files(repo_id)  # {path: row} in ONE query (no per-file N+1)
         if refs:
             pairs = [(ref, refs_parse(ref)) for ref in refs]
         else:
-            pairs = [(r["path"], r["path"]) for r in store.files(repo_id)]
+            pairs = [(p, p) for p in stored_by_path]
         out = []
         for ref, path in pairs:
-            row = store.get_file(repo_id, path)
-            read = read_file(settings.repo_root / path)
-            current = read[2] if read else None
-            stored = row["content_hash"] if row is not None else None
-            if current is None:
-                state = "missing"
-            elif stored is None:
-                state = "not_indexed"
-            elif current != stored:
-                state = "changed"
-            else:
-                state = "current"
+            state = _file_state(settings.repo_root / path, stored_by_path.get(path))
             out.append({"ref": ref, "path": path, "state": state,
                         "stale": state in ("missing", "changed", "not_indexed")})
         return out

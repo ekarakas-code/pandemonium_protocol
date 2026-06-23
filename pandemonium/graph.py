@@ -1307,12 +1307,14 @@ def render_edit_plan(p: dict) -> str:
     return "\n".join(out)
 
 
-def repo_logic_map(settings, topic: str, top_k: int = 12, graph=None) -> Optional[dict]:
+def repo_logic_map(settings, topic: str, top_k: int = 12, graph=None,
+                   retriever=None) -> Optional[dict]:
     """Conceptual flow for a topic: the relevant symbols (semantic search), the domains
     and files they live in, and how they call each other — a grounded 'logic map'."""
     from pandemonium.retrieval.hybrid_search import Retriever
 
-    retriever = Retriever(settings)
+    own = retriever is None  # only close a retriever we created (a shared one is the caller's)
+    retriever = retriever or Retriever(settings)
     try:
         results = retriever.search(topic, top_k=top_k)
         if not results:
@@ -1343,7 +1345,8 @@ def repo_logic_map(settings, topic: str, top_k: int = 12, graph=None) -> Optiona
         return {"topic": topic, "files": by_file, "domains": domains,
                 "connections": connections}
     finally:
-        retriever.close()
+        if own:
+            retriever.close()
 
 
 def _short_ref(ref: str) -> str:

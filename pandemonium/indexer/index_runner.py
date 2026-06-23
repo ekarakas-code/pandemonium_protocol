@@ -99,7 +99,7 @@ class Indexer:
         self._rebuild = False
 
     # -- public --------------------------------------------------------------
-    def run(self, incremental: bool = True) -> IndexStats:
+    def run(self, incremental: bool = True, compact: bool = True) -> IndexStats:
         stats = IndexStats()
         idx = self.settings.section("indexing")
         # cAST index-format bump (Improvements4 #3): an existing vector table that predates the
@@ -137,8 +137,12 @@ class Indexer:
             if incremental and self.tracker.is_unchanged(row, content_hash):
                 stats.skipped += 1
                 continue
-            self._index_file(cand, text, content_hash, stats, had_prior=row is not None)
-            stats.indexed += 1
+            try:
+                self._index_file(cand, text, content_hash, stats, had_prior=row is not None)
+                stats.indexed += 1
+            except Exception as e:  # one unparseable/broken file shouldn't abort the whole run
+                stats.errors += 1
+                self.audit.log("index_file_error", path=cand.rel_path, error=repr(e))
 
         for rel_path, row in stored.items():
             if rel_path not in scanned_paths:
@@ -148,7 +152,7 @@ class Indexer:
                 stats.deleted += 1
 
         self._flush_lance()
-        if stats.indexed or stats.deleted:
+        if compact and (stats.indexed or stats.deleted):
             self.lance.compact()
         self.sqlite.commit()
         self.audit.log("index_run", repo=self.repo_id, mode=self.tracker.mode,
@@ -316,7 +320,7 @@ class Indexer:
 
         # Persist metadata.
         file_rec = FileRecord(fid, self.repo_id, cand.rel_path, language, content_hash,
-                              cand.size, now_iso(), file_summary, 0)
+                              cand.size, now_iso(), file_summary, 0, mtime=cand.mtime)
         self.sqlite.upsert_file(file_rec)
         if symbols:
             self.sqlite.insert_symbols(symbols)
@@ -357,10 +361,10 @@ class Indexer:
         stats.chunks += len(chunks)
 
 
-def run_index(settings, incremental: bool = True) -> IndexStats:
+def run_index(settings, incremental: bool = True, compact: bool = True) -> IndexStats:
     indexer = Indexer(settings)
     try:
-        return indexer.run(incremental=incremental)
+        return indexer.run(incremental=incremental, compact=compact)
     finally:
         indexer.close()
 

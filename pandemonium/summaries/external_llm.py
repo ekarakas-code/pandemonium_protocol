@@ -19,6 +19,7 @@ class ExternalLLMSummarizer(HeuristicSummarizer):
         self.model = model
         self.max_tokens = max_tokens
         self.audit = audit
+        self._client = None  # built once on first use, then reused across files
 
     @classmethod
     def from_settings(cls, settings, audit=None) -> "ExternalLLMSummarizer":
@@ -27,10 +28,10 @@ class ExternalLLMSummarizer(HeuristicSummarizer):
                    max_tokens=int(ext.get("max_tokens", 256)), audit=audit)
 
     def _complete(self, prompt: str) -> str:
-        import anthropic  # only imported when actually enabled
-
-        client = anthropic.Anthropic()
-        msg = client.messages.create(
+        if self._client is None:
+            import anthropic  # only imported when actually enabled
+            self._client = anthropic.Anthropic()
+        msg = self._client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
             messages=[{"role": "user", "content": prompt}],

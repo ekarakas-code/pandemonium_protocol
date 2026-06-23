@@ -23,6 +23,7 @@ class FileRecord:
     last_indexed_at: str
     summary: Optional[str] = None
     importance: int = 0
+    mtime: float = 0.0  # st_mtime at index time; lets staleness stat-before-hash
 
 
 @dataclass

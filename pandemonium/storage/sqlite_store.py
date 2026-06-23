@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS files (
     size_bytes INTEGER,
     last_indexed_at TEXT NOT NULL,
     summary TEXT,
-    importance INTEGER DEFAULT 0
+    importance INTEGER DEFAULT 0,
+    mtime REAL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_files_repo_path ON files(repo_id, path);
 
@@ -200,6 +201,9 @@ class SqliteStore:
 
     def _migrate_columns(self) -> None:
         """Add later-phase columns to pre-existing tables (no-op if already present)."""
+        file_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(files)")}
+        if "mtime" not in file_cols:
+            self.conn.execute("ALTER TABLE files ADD COLUMN mtime REAL DEFAULT 0")
         chunk_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(chunks)")}
         for col in ("ref", "scope", "qualified_name", "parent", "tags",
                     "signature_hash", "fingerprint", "symbol_content_hash", "decl_ref",
@@ -255,14 +259,14 @@ class SqliteStore:
     def upsert_file(self, f: FileRecord) -> None:
         self.conn.execute(
             """INSERT INTO files(id, repo_id, path, language, content_hash, size_bytes,
-                                 last_indexed_at, summary, importance)
-               VALUES(?,?,?,?,?,?,?,?,?)
+                                 last_indexed_at, summary, importance, mtime)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET language=excluded.language,
                    content_hash=excluded.content_hash, size_bytes=excluded.size_bytes,
                    last_indexed_at=excluded.last_indexed_at, summary=excluded.summary,
-                   importance=excluded.importance""",
+                   importance=excluded.importance, mtime=excluded.mtime""",
             (f.id, f.repo_id, f.path, f.language, f.content_hash, f.size_bytes,
-             f.last_indexed_at, f.summary, f.importance),
+             f.last_indexed_at, f.summary, f.importance, f.mtime),
         )
 
     def chunk_ids_for_file(self, file_id: str) -> list[str]:
