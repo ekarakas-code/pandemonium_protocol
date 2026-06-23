@@ -82,6 +82,15 @@ DEFAULTS: dict[str, Any] = {
         # A bare-identifier query that names an EXACT symbol returns the symbol card
         # directly, skipping the keyword/vector channels (and the embedding-model load).
         "exact_short_circuit": True,
+        # Patch 4/5 structural reranker (retrieval.rerank_signals): on a CODE-intent query,
+        # demote PROSE cards below code (Patch 4) and demote bulk-data / generated constant
+        # cards (Patch 5), using FREE signals (language / chunk_type). DEFAULT OFF — a ranking
+        # change must be proven on EXTERNAL repos (run_eval --tasks crossover), never tuned to
+        # the 15-query dogfood gold. Bypasses the exact-symbol short-circuit + the channel
+        # baselines (those must stay byte-identical). Sub-flags ablate each signal.
+        "rerank": False,
+        "rerank_prose": True,
+        "rerank_density": True,
         # Auto-indexer (server self-heal): read tools incrementally reindex files changed
         # since the last check before serving, so mid-session edits are reflected without a
         # manual repo_reindex_changed. Debounced by auto_reindex_min_interval seconds (a

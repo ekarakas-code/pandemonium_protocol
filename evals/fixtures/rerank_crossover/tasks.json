@@ -1,0 +1,11 @@
+{
+  "_doc": "Patch 6 crossover task set (OFF-DOGFOOD). buried = code-intent queries whose domain words match the PROSE docs but NOT the implementation symbol name, so docs bury the code; the reranker (Patch 4 prose-demote) should HELP. control = an entrypoint query (the wrapper IS the answer) and a doc-intent query (the doc IS the answer) — the reranker must NOT regress either. Schema: {buried:[{q,files,symbols}], control:[...]}.",
+  "buried": [
+    {"q": "where is the billing amount computed in the service", "files": ["service.py"], "symbols": ["settle_account"]},
+    {"q": "how does the overdue late fee get computed", "files": ["service.py"], "symbols": ["assess_penalty"]}
+  ],
+  "control": [
+    {"q": "cli command to start the billing server", "files": ["cli.py"], "symbols": ["serve"]},
+    {"q": "billing overview and documentation guide", "files": ["docs/overview.md"], "symbols": []}
+  ]
+}

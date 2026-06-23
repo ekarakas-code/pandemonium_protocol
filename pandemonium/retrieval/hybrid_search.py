@@ -422,6 +422,15 @@ class Retriever:
                 is_complete_unit=_complete(row), safe_for_reasoning=_complete(row),
                 parent_ref=_row_get(row, "parent_ref")))
 
+        # Patch 4/5 structural rerank (gated, DEFAULT OFF). Applied to the wide pool BEFORE
+        # dedup/truncate. Bypassed for channel-isolation baselines + scope-filtered searches so
+        # those stay byte-identical; the exact-symbol short-circuit already returned earlier.
+        if r.get("rerank", False) and channels_only is None and chunk_types is None:
+            from pandemonium.retrieval import rerank_signals
+            results = rerank_signals.apply_penalties(
+                results, query, prose=r.get("rerank_prose", True),
+                density=r.get("rerank_density", True))
+
         results = (_dedup(results) if dedup else results)[:top_k]
         for res in results:
             res.reason = _reason(res)

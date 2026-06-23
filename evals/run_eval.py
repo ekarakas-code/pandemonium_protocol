@@ -130,9 +130,9 @@ def load_tasks(path: str):
     return queries, impact
 
 
-def run(repo: str = ".", gold=None, impact_gold=None) -> dict:
+def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
     gold = gold or GOLD
-    settings = Settings.load(repo)
+    settings = settings or Settings.load(repo)
     retriever = Retriever(settings)
     packer = ContextPacker(settings, retriever=retriever)
     counter = TokenCounter(settings.section("context_pack").get("tokenizer", "cl100k_base"))
@@ -767,6 +767,126 @@ def cast_eval(repo: str = ".") -> dict:
     return out
 
 
+def crossover_eval(repo: str = ".", tasks_path: str = None) -> dict:
+    """Patch 6 — the OFF-DOGFOOD ship gate for the structural reranker. Indexes an external
+    `--repo` fresh with the REAL model, loads a 2-class task file (`buried` = dispatcher/doc-
+    buried queries the rerank should HELP; `control` = exact-symbol/entrypoint/doc-intent
+    queries it must NOT hurt), and runs each class with the reranker OFF vs ON. PASS iff buried
+    IMPROVES while control does NOT regress — the crossover a single-repo dogfood A/B can't show.
+    THIS is what a rerank ships on, never `--rerank` on the 15-query gold."""
+    data = json.loads(Path(tasks_path).read_text(encoding="utf-8"))
+    classes = [("buried", data.get("buried", [])), ("control", data.get("control", []))]
+    settings = Settings.load(repo)
+    stats = service.index(settings, incremental=False)  # real model, fresh
+    print("=== Patch 6 crossover (external repo — the rerank SHIP gate) ===")
+    print(f"  repo={repo}  indexed files={stats.indexed} symbols={stats.symbols}")
+
+    def measure(gold, on):
+        s = Settings.load(repo)
+        if on:
+            s.data["retrieval"].update({"rerank": True, "rerank_prose": True, "rerank_density": True})
+        retr = Retriever(s)
+        m = _rank_metrics(retr, gold, lambda q: retr.search(q, top_k=10))
+        retr.close()
+        return m
+
+    res = {}
+    for name, gold in classes:
+        if not gold:
+            continue
+        off, on = measure(gold, False), measure(gold, True)
+        res[name] = (off, on)
+        print(f"\n  [{name}] n={len(gold)}")
+        print(f"    {'arm':6s}{'P@1':>7}{'P@3':>7}{'P@5':>7}{'MRR':>7}")
+        for lbl, m in (("off", off), ("on", on)):
+            print(f"    {lbl:6s}{m['p1']:7.3f}{m['p3']:7.3f}{m['p5']:7.3f}{m['mrr']:7.3f}")
+    if "buried" in res and "control" in res:
+        (bo, bn), (co, cn) = res["buried"], res["control"]
+        improved = (bn["p5"] > bo["p5"] + 1e-9) or (bn["mrr"] > bo["mrr"] + 1e-9)
+        regressed = (cn["p5"] < co["p5"] - 1e-9) or (cn["mrr"] < co["mrr"] - 1e-9)
+        ok = improved and not regressed
+        print(f"\n  CROSSOVER: {'PASS' if ok else 'FAIL'}  "
+              f"(buried improved={improved}; control regressed={regressed})")
+    print("  READ: the OFF-DOGFOOD ship gate. A rerank ships only on PASS here — never on the "
+          "15-query dogfood A/B (--rerank).")
+    return res
+
+
+def rerank_eval(repo: str = ".", gold=None) -> dict:
+    """Patch 4/5 ablation A/B (dogfood — NOT a ship gate). Runs the gold under the structural
+    reranker OFF vs prose-only vs density-only vs both, on ONE fresh index, toggling only
+    `retrieval.rerank*`. Prints aggregate + per-query rank moves so each signal's effect is
+    visible. The default/gate stays OFF/unmoved; the real ship decision is the EXTERNAL --tasks
+    crossover (never this dogfood set)."""
+    arms = {
+        "off":     {"rerank": False},
+        "prose":   {"rerank": True, "rerank_prose": True,  "rerank_density": False},
+        "density": {"rerank": True, "rerank_prose": False, "rerank_density": True},
+        "both":    {"rerank": True, "rerank_prose": True,  "rerank_density": True},
+    }
+    out = {}
+    for name, cfg in arms.items():
+        s = Settings.load(repo)
+        s.data["retrieval"].update(cfg)
+        out[name] = run(repo, gold=gold, settings=s)
+    keys = [("precision_at_1", "P@1"), ("precision_at_3", "P@3"), ("precision_at_5", "P@5"),
+            ("mrr", "MRR"), ("resolution_rate", "resol"), ("wrong_symbol_same_name_rate", "wrongsym")]
+    print("=== Patch 4/5 rerank A/B (dogfood; NOT a ship gate — external --tasks decides) ===")
+    print("  " + f"{'arm':9s}" + "".join(f"{lbl:>9}" for _, lbl in keys))
+    for name in arms:
+        s = out[name]["summary"]
+        print("  " + f"{name:9s}" + "".join(f"{s[k]:9.3f}" for k, _ in keys))
+    base = {row["q"]: row["file_rank"] for row in out["off"]["rows"]}
+    print("\n  per-query file_rank (off -> both); only moved queries:")
+    for row in out["both"]["rows"]:
+        o, n = base[row["q"]], row["file_rank"]
+        if o != n:
+            os_, ns_ = ("-" if o is None else str(o)), ("-" if n is None else str(n))
+            tag = "better" if (n is not None and (o is None or n < o)) else "worse "
+            print(f"    {tag} {os_:>3} -> {ns_:<3} {row['q'][:52]}")
+    print("\n  READ: dogfood A/B only. SHIP requires the EXTERNAL crossover (win on dispatcher/"
+          "doc-buried queries WHILE not losing on exact-symbol/control). Do NOT re-baseline on this.")
+    return out
+
+
+def signals_report(repo: str = ".", gold=None) -> None:
+    """OBSERVE-ONLY (Patch 2): print the three structural rerank SIGNALS per top card so we can
+    SEE where a delegator / code-vs-prose / constant-density rerank WOULD fire — BEFORE any of
+    it touches scoring. Changes NO ranking: `run()` and `--gate` are untouched (verify by a
+    flat `--gate` after this lands). Uses a wider top-50 pool so a buried implementation is
+    visible (Patch 3 must rerank over a wide pool, then emit top-10)."""
+    from pandemonium.graph import GraphIndex
+    from pandemonium.retrieval import rerank_signals as sig
+
+    gold = gold or GOLD
+    settings = Settings.load(repo)
+    retriever = Retriever(settings)
+    store, repo_id = retriever.sqlite, retriever.repo_id
+    idx = GraphIndex(store, repo_id)  # built once; resolves wrapper -> impl chains
+    print("=== Rerank signals (OBSERVE-ONLY — no ranking change) ===")
+    print("  ct=content_type  vis=search_visibility  scores=sym/kw/vec->combined  "
+          "deleg=delegator->leaf_implementation(s)")
+    for i, item in enumerate(gold):
+        res = retriever.search(item["q"], top_k=50)
+        intent = sig.query_intent(item["q"])
+        grank = _first_rank(res, item["files"], "path")
+        print(f"\n[{i:2d}] intent={intent:10s} gold@{'-' if grank is None else grank:<3}"
+              f"  {item['q'][:58]}")
+        for rank, rr in enumerate(res[:6]):
+            cs = rr.channel_scores or {}
+            leaves = sig.delegator_leaves(rr, store, idx)
+            deleg = ("YES->" + ",".join(sorted({l["name"] for l in leaves}))) if leaves else "-"
+            anchor = rr.ref or f"{rr.path}::{rr.symbol_name or rr.chunk_type or ''}"
+            print(f"   {rank:2d} {sig.content_type(rr):9s} {sig.search_visibility(rr):12s} "
+                  f"{cs.get('symbol', 0.0):.2f}/{cs.get('keyword', 0.0):.2f}/"
+                  f"{cs.get('vector', 0.0):.2f}->{rr.score:.3f} deleg={deleg:24s} {anchor}")
+    retriever.close()
+    print("\n  READ: observe-only. Look for (a) thin CLI/MCP wrappers flagged deleg=YES with the "
+          "real implementation as their callee, (b) prose/data cards with ct!=code outranking "
+          "code, (c) where query_intent mislabels (e.g. an 'mcp'/'cli' query that should still "
+          "find the implementation, not the launcher) — those calibrate Patch 3/4/5.")
+
+
 def perquery(repo: str = ".", gold=None, impact_gold=None) -> None:
     """Per-query rank + top-1 ref — for diffing two index states (e.g. heuristic vs
     enriched) to see exactly which query moved. Also prints per-symbol caller-edge detail
@@ -814,6 +934,16 @@ if __name__ == "__main__":
                     help="path to an external task set (JSON/YAML) for run/baselines against "
                          "ANY indexed repo; pair with --repo (the large-repo / cross-file set)")
     ap.add_argument("--perquery", action="store_true", help="per-query rank + top1 ref")
+    ap.add_argument("--signals", action="store_true",
+                    help="OBSERVE-ONLY structural rerank signals per top card "
+                         "(delegator/prose/density) — changes no ranking (Patch 2)")
+    ap.add_argument("--rerank", action="store_true",
+                    help="Patch 4/5 rerank A/B: off vs prose vs density vs both "
+                         "(dogfood ablation; NOT a ship gate)")
+    ap.add_argument("--crossover", default=None,
+                    help="path to a 2-class task file {buried, control}; the OFF-DOGFOOD rerank "
+                         "ship gate. Indexes --repo fresh (real model) — point it at an external "
+                         "repo/fixture, not the main repo")
     ap.add_argument("--gate", default=None,
                     help="label -> compare to evals/<label>.json; exit 1 if a hard "
                          "metric regressed (M1 lock + M3 acceptance gate)")
@@ -825,6 +955,12 @@ if __name__ == "__main__":
 
     if args.perquery:
         perquery(args.repo, gold=gold, impact_gold=impact_gold)
+    elif args.signals:
+        signals_report(args.repo, gold=gold)
+    elif args.rerank:
+        rerank_eval(args.repo, gold=gold)
+    elif args.crossover:
+        crossover_eval(args.repo, args.crossover)
     elif args.baselines:
         baselines(args.repo, gold=gold)
     elif args.cast:
