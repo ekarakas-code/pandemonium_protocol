@@ -57,3 +57,69 @@ On **equal, correct outcomes**, PandemoniumProtocol is **cost/token-neutral-to-p
 on its worst-case task mix**, and its advantage **scales with codebase size and how hard code
 is to locate**. Raw data: `D:\_bench\results.jsonl`; harness: `evals/ab_runner.py`,
 `evals/ab_tasks.py`, `evals/ab_tasks_extra.json`.
+
+---
+
+# Re-run 2026-06-23 — on a *validated* harness (Arm B reindex now actually works)
+
+**Why re-run + what was wrong before.** A smoke run exposed that `ab_runner.copy_env()` forced
+`HF_HUB_OFFLINE=1` but never pointed `HF_HOME` at a cache holding the bge model — so **Arm B's
+reindex failed offline and Arm B silently ran WITHOUT the protocol** (the comparison was
+invalid; B was just vanilla Claude + idle MCP overhead). Fixed in `copy_env` (point
+`HF_HOME`/`TIKTOKEN_CACHE_DIR` at the repo's `.pandemonium` cache when offline). **This run is
+the first with all 9 Arm-B reindexes verified `ok=True` (0 failures)** — so the protocol is
+genuinely exercised. (The prior run above never recorded reindex status; treat it as suspect.)
+
+**Setup.** 9 well-formed seeded-bug tasks (4 of 13 skipped as **malformed** — Tier-3 + the
+edge-eval commits changed their target lines, so the mutation no longer breaks a test), **1
+repeat, 2 arms = 18 runs**. Sonnet agent / Opus blind judge / objective full-suite grading /
+tests restored from pristine before grading (anti-cheat). Pristine = current HEAD (`c506bd9`),
+verified green (174 passed).
+
+## Headline (paired, B = with protocol)
+
+| metric | A (vanilla) | B (protocol) |
+|---|---|---|
+| **Correct fix, no regression** | **9/9** | **9/9** |
+| Mean cost / task | $0.379 | **$0.326** |
+| Paired cost delta (B−A) | mean **−$0.054** (~14% cheaper) | |
+| Paired total-token delta (B−A) | mean **−188,607** | |
+| Mean turns | 13.3 | **11.2** |
+| Blind judge | 1 win | 0 wins (8 ties) |
+
+**Protocol is net cheaper, fewer turns, and fewer tokens at identical correctness.**
+
+## Per task (cost A → B)
+
+| task (subsystem) | A $ | B $ | Δ (B−A) | turns A/B | winner |
+|---|---|---|---|---|---|
+| `partition_tests_ref_vs_path` (brief.py) | 0.607 | 0.278 | **−0.330** | 15/11 | tie |
+| `fingerprint_drop_signature` (util.py) | 0.435 | 0.229 | **−0.206** | 22/13 | A (B 4 vs 5) |
+| `tie_break_reversed` (hybrid_search.py) | 0.261 | 0.167 | −0.094 | 9/5 | tie |
+| `ledger_add_dedupe_bypass` (session.py) | 0.302 | 0.214 | −0.088 | 14/7 | tie |
+| `query_tokens_drop_first` (symbol_search.py) | 0.326 | 0.278 | −0.048 | 13/12 | tie |
+| `head_view_off_by_one` (refs.py) | 0.272 | 0.230 | −0.043 | 10/11 | tie |
+| `is_test_path_wordboundary` (tests_finder.py) | 0.234 | 0.221 | −0.013 | 14/11 | tie |
+| `confidence_overfire` (confidence.py) | 0.155 | 0.316 | **+0.162** | 6/12 | tie |
+| `ambiguous_callee_boundary_off_by_one` (graph.py) | 0.822 | 1.000 | **+0.178** | 17/19 | tie |
+
+## Honest read
+
+- **B cheaper on 7/9 tasks**, with the biggest wins on the *location-heavy* bugs
+  (`partition_tests`, `fingerprint`, `ledger`, `tie_break`) — consistent with the thesis that
+  the edge is finding code, not fixing it.
+- **Two tasks went to A.** `confidence_overfire` (+$0.16) is a localized one-liner where the
+  MCP-schema + reindex overhead doesn't pay off. `ambiguous_callee_boundary_off_by_one`
+  (+$0.18) is a **reversal of the prior run's headline graph-win** — here the protocol agent
+  *over-explored* (19 turns / $1.00 vs 17 / $0.82). It's **n=1** and per-task variance is high;
+  don't over-read a single cross-file point in either direction.
+- **Quality:** 8 ties + 1 A win (`fingerprint`: B scored 4 vs A 5 — while costing ~half). No
+  correctness or regression differences anywhere.
+
+## Caveats
+- **Small repo (~120 files) is close to the protocol's worst case** — its real edge is locating
+  code in *large* codebases, which this benchmark barely tests.
+- **n=1 (no repeats this run)** — per-task dollars are directional; the **means** (cost/token/
+  turn deltas) are the trustworthy signal. The headline matches the prior run's conclusion
+  (cost/token-neutral-to-positive on the worst-case mix) — now on a harness where Arm B's index
+  actually built. Raw data: `C:\_bench\results.jsonl`.
