@@ -52,6 +52,14 @@ def test_signature_change_flags_callsites_to_verify(tmp_path):
     assert any("go" in c for c in callers)
 
 
+def test_dangling_import_of_removed_symbol(tmp_path):
+    settings = _index(tmp_path, {"util.py": "def parse(x):\n    return x\n", "run.py": CALLER})
+    (tmp_path / "util.py").write_text("def other(y):\n    return y + 9\n", encoding="utf-8")
+    result = breakage_check(settings)
+    importers = [d["importer_path"] for d in result["dangling_imports"]]
+    assert any("run.py" in p for p in importers)  # `from util import parse` now dangles
+
+
 def test_flag_off_is_noop(tmp_path):
     settings = _index(tmp_path, {"util.py": "def parse(x):\n    return x\n"})
     # default: retrieval.breakage_check is False

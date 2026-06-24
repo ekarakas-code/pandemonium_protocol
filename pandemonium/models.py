@@ -87,7 +87,7 @@ class Chunk:
     # is_complete_unit=False; repo_get auto-upgrades to the parent. safe_for_reasoning is
     # NOT stored — it is derived downstream as (is_complete_unit and not requires_parent_header).
     is_complete_unit: bool = True
-    unit_kind: Optional[str] = None  # function|method|class_outline|file_outline|ast_block|block|window
+    unit_kind: Optional[str] = None  # function|method|class_outline|file_outline|ast_block|block|window|module_body
     parent_ref: Optional[str] = None
     requires_parent_header: bool = False
     requires_imports: bool = False

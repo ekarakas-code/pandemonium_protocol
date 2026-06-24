@@ -7,7 +7,8 @@ dispatch / reflection, framework-registered or string-keyed calls, cross-languag
 (resolution is language-scoped), files this index doesn't cover, and the symmetric case where
 an edited function now MIS-calls an unchanged callee (its new edges aren't indexed yet). A bare
 "no breakage" would be exactly the confident-wrong output the project forbids, so the
-not-covered block is emitted on every result (clean, dirty, or empty).
+not-covered block accompanies every ANALYZED result (clean or dirty); the empty (nothing changed)
+and disabled cases carry their own honest message instead.
 
 Reuses GraphIndex.resolve_call / _callers_of — rebuilds no resolution.
 """
@@ -25,7 +26,8 @@ from pandemonium.refs import _match_by_fingerprint, _read_lines, parse_ref
 from pandemonium.storage.sqlite_store import SqliteStore
 from pandemonium.util import repo_id_for, signature_hash_for
 
-# The fixed limits block. ALWAYS rendered — a result without it could read as a guarantee.
+# The fixed limits block. Rendered on every ANALYZED (ok) result — a clean pass without it could
+# read as a guarantee. (The empty/disabled cases carry their own honest message.)
 _NOT_COVERED = (
     "> This is a LOWER BOUND of static, compiler-catchable breakage — it does NOT prove the "
     "code compiles. Not covered: dynamic dispatch / reflection, framework-registered or "
@@ -109,11 +111,13 @@ def breakage_check(settings, target: Optional[str] = None, graph: "GraphIndex" =
                              "callers": callers, "callers_possible": possible})
 
         dangling, seen = [], set()
+        # 'imports' edges are FILE-sourced (source_id == file_id), so resolve the importer via
+        # the files table, NOT idx.by_id (which is symbol-keyed).
+        file_paths = {row["id"]: p for p, row in store.all_files(repo_id).items()}
 
         def _add_import(name: str, why: str):
             for e in store.edges_by_target_name(repo_id, name, "imports"):
-                src = idx.by_id.get(e["source_id"])
-                ip = src["path"] if src else None
+                ip = file_paths.get(e["source_id"])
                 if ip and (ip, name) not in seen:
                     seen.add((ip, name))
                     dangling.append({"importer_path": ip, "name": name, "why": why,
@@ -121,6 +125,11 @@ def breakage_check(settings, target: Optional[str] = None, graph: "GraphIndex" =
 
         for dp in deleted_paths:
             _add_import(Path(dp).stem, "module/file deleted from the index")
+            # `from <module> import X` records the edge under X (the symbol), not the module
+            # stem — so also check the names the deleted file exported (still in the index).
+            for s in idx.by_id.values():
+                if s["path"] == dp:
+                    _add_import(s.get("res_name") or s["name"], "symbol's file deleted from index")
         for r in removed:
             bare = _norm(r["ref"].split("::", 1)[-1]).split(".")[-1] if "::" in r["ref"] else ""
             if bare:

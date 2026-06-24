@@ -136,22 +136,36 @@ def _strip_stamp(block: str) -> str:
     return "\n".join(line for line in block.splitlines() if "Believed as of" not in line)
 
 
+_ANCHOR = f"{START}\n{NOTICE}"
+
+
 def write_skeleton_into_claude_md(repo_root, body: str) -> bool:
-    """Idempotent marker-bounded write. Returns True if CLAUDE.md changed. Requires BOTH markers
-    for an in-place replace; otherwise APPENDS a fresh block (never clobbers user content). Skips
-    the write when only the timestamp would change (anti-churn)."""
+    """Idempotent marker-bounded write. Returns True iff CLAUDE.md changed. Replaces ONLY a clean
+    anchored block (the START+NOTICE prefix, paired with the FIRST END after it); APPENDS only when
+    the file has NO marker at all; and BAILS (writes nothing, returns False) on any stray / partial
+    / misordered marker (a lone START or END, a prose mention, an interrupted write). This anchors
+    on the contiguous managed prefix — a bare START in user prose isn't followed by the exact
+    NOTICE line — so it can neither clobber user content nor re-append unboundedly. Also skips the
+    write when only the timestamp would change (anti-churn)."""
     block = f"{START}\n{NOTICE}\n{body}\n{END}"
     path = Path(repo_root) / "CLAUDE.md"
     if not path.exists():
         path.write_text(block + "\n", encoding="utf-8")
         return True
     text = path.read_text(encoding="utf-8")
-    i, j = text.find(START), text.find(END)
-    if i != -1 and j != -1 and j > i:
+    i = text.find(_ANCHOR)
+    if i != -1:
+        j = text.find(END, i + len(_ANCHOR))
+        if j == -1:
+            return False  # truncated/corrupt managed block — refuse to splice
         if _strip_stamp(text[i:j + len(END)]) == _strip_stamp(block):
-            return False
+            return False  # anti-churn: only the stamp would change
         path.write_text(text[:i] + block + text[j + len(END):], encoding="utf-8")
         return True
+    # No clean anchored block. Append ONLY when no marker of any kind is present; a stray marker
+    # means an unknown boundary — bail rather than risk a clobber or an unbounded re-append.
+    if START in text or END in text:
+        return False
     sep = "" if text.endswith("\n") else "\n"
     path.write_text(f"{text}{sep}\n{block}\n", encoding="utf-8")
     return True

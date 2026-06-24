@@ -57,6 +57,18 @@ def test_write_idempotent_and_preserves_user_content(tmp_path):
     assert text.count("pandemonium:skeleton:start") == 1
 
 
+def test_write_bails_on_stray_marker(tmp_path):
+    from pandemonium.skeleton import START
+    # a lone START in user prose (no NOTICE/END) must NOT be treated as a managed block
+    (tmp_path / "CLAUDE.md").write_text(f"# Docs\nUse `{START}` to mark.\nIMPORTANT user notes.\n",
+                                        encoding="utf-8")
+    body = "## Architectural skeleton (believed-then)\n_Believed as of T._\nstructure"
+    assert write_skeleton_into_claude_md(tmp_path, body) is False  # bail, don't clobber/append
+    text = (tmp_path / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "IMPORTANT user notes." in text  # user content preserved
+    assert text.count("pandemonium:skeleton:start") == 1  # no duplication
+
+
 def test_service_gate(tmp_path, monkeypatch):
     settings = _indexed(tmp_path, {"pkg/m.py": "def f():\n    return 1\n"})
     # skip the real re-index; we are exercising only the skeleton gate inside service.index
