@@ -13,6 +13,9 @@ authors = [{ name = "PandemoniumProtocol" }]
 dependencies = [
     "lancedb>=0.20",
     "sentence-transformers>=3.0",
+    # Declared explicitly (not left transitive via sentence-transformers): the embedder needs
+    # it, and the project is CPU-only / local-first. Pin a CPU build via your index/extra-index.
+    "torch>=2.2",
     "tree-sitter>=0.25",
     "tree-sitter-python>=0.23",
     "tree-sitter-cpp>=0.23",

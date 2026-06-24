@@ -82,7 +82,11 @@ def _format_results(results: List[SearchResult], assessment=None) -> str:
     for i, r in enumerate(results, 1):
         ref = r.ref or f"{r.path}:{r.start_line}-{r.end_line}"
         partial = "" if r.is_complete_unit else " partial"  # cAST: a sub-block, not a whole unit
-        lines.append(f"{i}. ref={ref} [{r.scope or r.chunk_type}{partial}] score={r.score}")
+        # #7.4 size hint: line count lets the agent choose a cost-aware fetch (view=signature
+        # for a big symbol) instead of blindly repo_get-ing the whole thing.
+        loc = (r.end_line - r.start_line + 1) if (r.start_line and r.end_line) else 0
+        size = f" ~{loc}L" if loc else ""
+        lines.append(f"{i}. ref={ref} [{r.scope or r.chunk_type}{partial}{size}] score={r.score}")
         if r.summary:
             lines.append(f"   {r.summary}")
         tagline = _format_tagline(r.tags)
@@ -232,6 +236,7 @@ class ToolContext:
 
     def repo_get(self, ref: str, expand: str = "exact", view: str = "full") -> str:
         self.audit.log("mcp_tool", tool="repo_get", ref=ref, expand=expand, view=view)
+        refetched = self.ledger.already_fetched(ref)  # #7.5: consult BEFORE recording this fetch
         self.ledger.record_fetch(ref)
         from pandemonium import refs
         repo_id = self.retriever.repo_id
@@ -257,11 +262,22 @@ class ToolContext:
             notes.append("re-found by body after a likely rename — the ref name is outdated")
         if resolved.note:
             notes.append(resolved.note)
+        if resolved.truncated:  # #7.4: the max_lines clamp used to be silent
+            shown = resolved.end_line - resolved.start_line + 1
+            notes.append(f"truncated: showing {shown} of {shown + resolved.truncated} lines "
+                         f"(max_lines cap) — narrow with view=lines:a-b")
+        if refetched:  # #7.5: re-fetch awareness
+            notes.append("re-fetch: you already fetched this ref earlier this session")
+        # #8: content-blind secret redaction on the OUTPUT path (never relay raw secrets to the model)
+        from pandemonium.secret_filter import redact_secrets
+        code, n_secrets = redact_secrets(resolved.code)
+        if n_secrets:
+            notes.append(f"redacted {n_secrets} secret-like value(s) from the output")
         if notes:
             head += "  (" + "; ".join(notes) + ")"
         if resolved.decl_ref:  # C++ out-of-line def: also declared in a sibling header
             head += f"\n  declared in {resolved.decl_ref}"
-        return f"{head}\n\n{resolved.code}"
+        return f"{head}\n\n{code}"
 
     def repo_context_pack(self, task: str, token_budget: int = 4000, mode: str = "") -> str:
         self.audit.log("mcp_tool", tool="repo_context_pack", task=task,

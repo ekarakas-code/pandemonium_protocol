@@ -43,6 +43,18 @@ def init(path: str = typer.Argument(".", help="Repository root to initialize."))
         ignore.write_text(DEFAULT_IGNORE, encoding="utf-8")
         console.print(f"[green]created[/] {ignore.name}")
 
+    # Keep the local index (machine-specific, rebuilt by the tool) out of version control.
+    gitignore = root / ".gitignore"
+    entry = ".pandemonium/"
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if entry not in existing.splitlines():
+        with gitignore.open("a", encoding="utf-8") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
+            fh.write("# PandemoniumProtocol local index (machine-specific, rebuilt by the tool)\n"
+                     f"{entry}\n")
+        console.print(f"[green]updated[/] .gitignore (+{entry})")
+
     console.print(f"[bold green]Initialized[/] PandemoniumProtocol at {root}")
     console.print("Next: [bold]pandemonium index .[/]")
 

@@ -66,6 +66,7 @@ class ResolvedCode:
     safe_for_reasoning: bool = True  # derived: is_complete_unit
     parent_ref: Optional[str] = None
     note: Optional[str] = None  # e.g. auto-upgrade explanation
+    truncated: int = 0  # lines dropped by the max_lines safety clamp (0 = nothing clamped)
 
 
 def build_ref(path: str, scope: str, qualified_name: Optional[str] = None,
@@ -103,7 +104,14 @@ def parse_ref(ref: str) -> Tuple[str, Optional[str], Optional[Tuple[int, int]], 
 
 def _read_lines(repo_root: Path, rel_path: str) -> Optional[List[str]]:
     try:
-        return (repo_root / rel_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        root = repo_root.resolve()
+        target = (root / rel_path).resolve()
+        # Path-traversal containment: a ref is agent-supplied, so an absolute path or a
+        # `../`-escape ("../../etc/passwd", "C:\\Windows\\...") must never read outside the
+        # indexed repo. .resolve() also collapses any symlink that would escape.
+        if target != root and root not in target.parents:
+            return None
+        return target.read_text(encoding="utf-8", errors="replace").splitlines()
     except (OSError, ValueError):
         return None
 
@@ -258,14 +266,16 @@ def resolve(repo_root, ref: str, expand: str = "exact", neighbor_lines: int = 8,
     # view narrows the (post-expand) span — the token-efficiency lever — before the
     # max_lines safety clamp, so a 'signature'/'head:N' view is always honored in full.
     start, end = _apply_view(view, start, end, lines)
+    truncated = 0
     if end - start + 1 > max_lines:
+        truncated = (end - start + 1) - max_lines
         end = start + max_lines - 1
 
     code = "\n".join(lines[start - 1:end])
     return ResolvedCode(ref=ref, path=path, scope=scope, qualified_name=qname,
                         start_line=start, end_line=end, code=code, expand=expand,
                         stale=stale, ambiguous=ambiguous, resolved_by=resolved_by,
-                        view=view or VIEW_FULL)
+                        view=view or VIEW_FULL, truncated=truncated)
 
 
 def resolve_from_row(repo_root, ref: str, row, expand: str = "exact",
