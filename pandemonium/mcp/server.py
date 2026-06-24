@@ -94,6 +94,14 @@ def build_server(settings, embedder=None):
         return ctx.repo_impact(ref)
 
     @mcp.tool()
+    def repo_health() -> str:
+        """Is the protocol ARMED? Reports the running version, whether an index exists and is
+        loadable, the offline model-cache status, and file/symbol/chunk counts. Call this when
+        retrieval tools return nothing unexpectedly — it distinguishes 'not indexed / disarmed by
+        an upgrade' from 'your query/ref was wrong'. Always available (not gated)."""
+        return ctx.repo_health()
+
+    @mcp.tool()
     def repo_check(target: str = "") -> str:
         """After editing (before you can run the code), report a FLOOR of compiler-catchable
         breakage from edits NOT yet indexed: call-sites whose callee was removed/renamed,

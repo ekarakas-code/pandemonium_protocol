@@ -168,6 +168,13 @@ def impact_for(settings, ref: str):
     return repo_impact(settings, ref)
 
 
+def health(settings) -> dict:
+    """Protocol readiness (M4): version, index presence, model cache, counts. Always available."""
+    AuditLog(settings.audit_log_path).log("repo_health", surface="cli")
+    from pandemonium.health import health_report
+    return health_report(settings)
+
+
 def breakage(settings, target: str = None) -> dict:
     """Post-edit static breakage FLOOR (gated: retrieval.breakage_check). target=None => files
     changed since the index; a 'path::Qualified.Name'/'path' ref => just that symbol/file."""

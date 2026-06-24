@@ -238,6 +238,15 @@ def impact(ref: str, repo: str = _REPO_OPT) -> None:
 
 
 @app.command()
+def doctor(repo: str = _REPO_OPT) -> None:
+    """Health check: version, index presence, model cache, counts — is the protocol armed?
+    Run this when retrieval comes back empty to tell 'not indexed / disarmed' from a bad query."""
+    settings = Settings.load(repo)
+    from pandemonium.health import render_health
+    typer.echo(render_health(service.health(settings)))
+
+
+@app.command()
 def check(target: str = typer.Argument(""), repo: str = _REPO_OPT) -> None:
     """Post-edit breakage FLOOR: call-sites whose callee was removed/renamed, changed
     signatures, dangling imports — for edits not yet indexed. Gated: retrieval.breakage_check."""

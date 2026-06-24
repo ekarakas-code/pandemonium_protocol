@@ -119,7 +119,7 @@ class ToolContext:
         "repo_map", "repo_search", "repo_symbol", "repo_get", "repo_context_pack",
         "repo_find_tests", "repo_reindex_changed", "repo_session", "repo_graph",
         "repo_impact", "repo_edit_plan", "repo_logic_map", "repo_brief", "repo_changed",
-        "repo_check",
+        "repo_check", "repo_health",
     )
 
     def __init__(self, settings, embedder=None):
@@ -352,6 +352,11 @@ class ToolContext:
         if g:  # direct callers are confident edges into this ref
             self.ledger.record_edges([f"{d} -> {g['ref']}" for d in g.get("direct", [])])
         return render_impact(g) if g else f"Ref not found in the graph: {ref}"
+
+    def repo_health(self) -> str:
+        self.audit.log("mcp_tool", tool="repo_health")
+        from pandemonium.health import health_report, render_health
+        return render_health(health_report(self.settings))
 
     def repo_check(self, target: str = "") -> str:
         self.audit.log("mcp_tool", tool="repo_check", target=target)
