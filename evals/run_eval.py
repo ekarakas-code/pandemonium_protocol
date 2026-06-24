@@ -17,8 +17,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+# Local-first: point HF_HOME at the repo's bundled model cache (the A/B runners do the same in
+# their subprocess env) so `python evals/run_eval.py` and --matrix load bge-small fully offline.
+# Must run BEFORE huggingface_hub is imported (it resolves the cache path at import). The #11
+# matrix fixtures ship no model of their own — they share this cache.
+_HF_CACHE = Path(__file__).resolve().parent.parent / ".pandemonium" / "hf"
+if _HF_CACHE.exists():
+    os.environ.setdefault("HF_HOME", str(_HF_CACHE))
 
 sys.path.insert(0, str(Path(__file__).parent))  # make `gold` importable
 
@@ -83,6 +92,29 @@ def _impact_per_case(settings, impact_gold=None) -> list:
     return rows
 
 
+def _tests_pr(settings, tests_gold) -> dict:
+    """Deterministic test-selection scoring (#11 'test selection' task type): find_tests(target)
+    vs hand-authored expected test paths. An expected entry is hit if any of its POSIX substrings
+    appears in a returned test path — the same path-substring convention used for `files`."""
+    tp = fp = fn = pred = gold = exact = 0
+    for item in tests_gold:
+        got = list(service.tests(settings, item["target"], limit=10))
+        subs = item["expected_tests"]
+        want_hit = [w for w in subs if any(w in g for g in got)]
+        matched = [g for g in got if any(w in g for w in subs)]
+        tp += len(want_hit)
+        fn += len(subs) - len(want_hit)
+        fp += len(got) - len(matched)
+        pred += len(got)
+        gold += len(subs)
+        exact += int(len(matched) == len(got) and len(want_hit) == len(subs))
+    n = max(len(tests_gold), 1)
+    return {"tests_precision": round(tp / max(pred, 1), 3),
+            "tests_recall": round(tp / max(gold, 1), 3),
+            "tests_exact_case_rate": round(exact / n, 3),
+            "tests_cases": len(tests_gold)}
+
+
 def _first_rank(results, needles, attr):
     """0-based rank of the first result whose `attr` matches any needle; else None."""
     for i, r in enumerate(results):
@@ -96,6 +128,24 @@ def _first_rank(results, needles, attr):
     return None
 
 
+def _recall_at_k(results, expected, attr, k) -> float:
+    """Fraction of DISTINCT `expected` needles matched within the top-k results. Path needles
+    substring-match (like _first_rank); symbol needles exact-match. This is the coverage metric
+    _first_rank can't give (it stops at the first hit) — load-bearing for the feature / API-
+    refactor task types, whose gold lists MULTIPLE expected sites."""
+    if not expected:
+        return 0.0
+    topk = results[:k]
+    hit = 0
+    for needle in expected:
+        for r in topk:
+            value = getattr(r, attr) or ""
+            if (needle in value) if attr == "path" else (needle == value):
+                hit += 1
+                break
+    return hit / len(expected)
+
+
 def _card_line(r) -> str:
     sym = r.symbol_name or r.chunk_type or ""
     return f"- {r.path}::{sym} (L{r.start_line}-{r.end_line}) — {r.summary or ''}"
@@ -104,13 +154,14 @@ def _card_line(r) -> str:
 def load_tasks(path: str):
     """Load an EXTERNAL retrieval task set so the harness can run against ANY indexed repo —
     the large-repo / cross-file task set (Improvements3 #9's `tasks.yaml`, made real and
-    repo-agnostic). Returns (queries, impact).
+    repo-agnostic) and the #11 matrix fixtures. Returns (queries, impact, tests).
 
     JSON by default; YAML when the path ends .yaml/.yml AND PyYAML is installed (no hard dep).
     Schema: a top-level LIST of query items, OR a dict with `queries` (required) + optional
-    `impact`. Each query: {q, files:[POSIX path substrings], symbols?:[bare names]}. Each
-    impact: {ref: "path::Qualified.Name", true_direct:[refs]}. Extra keys (e.g. `_doc`) are
-    ignored, so a template can document itself inline."""
+    `impact` + optional `tests`. Each query: {q, files:[POSIX path substrings], symbols?:[bare
+    names], type?}. Each impact: {ref: "path::Qualified.Name", true_direct:[refs], type?}. Each
+    tests: {target:[bare name], expected_tests:[path substrings], type?}. Extra keys (e.g. `_doc`,
+    `type`) are ignored by the loader, so a template can document itself inline."""
     p = Path(path)
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() in (".yaml", ".yml"):
@@ -119,28 +170,32 @@ def load_tasks(path: str):
     else:
         data = json.loads(text)
     if isinstance(data, list):
-        queries, impact = data, []
+        queries, impact, tests = data, [], []
     else:
-        queries, impact = data.get("queries", []), data.get("impact", [])
+        queries = data.get("queries", [])
+        impact = data.get("impact", [])
+        tests = data.get("tests", [])
     if not queries:
         raise SystemExit(f"no queries in task file: {path}")
     for i, item in enumerate(queries):
         if "q" not in item or "files" not in item:
             raise SystemExit(f"task[{i}] needs at least 'q' and 'files': {item!r}")
-    return queries, impact
+    return queries, impact, tests
 
 
-def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
-    gold = gold or GOLD
-    settings = settings or Settings.load(repo)
-    retriever = Retriever(settings)
-    packer = ContextPacker(settings, retriever=retriever)
-    counter = TokenCounter(settings.section("context_pack").get("tokenizer", "cl100k_base"))
-
+def _score_queries(retriever, packer, counter, settings, gold, impact_gold=None,
+                   score_impact=True, mode=None) -> dict:
+    """Score one query list against an ALREADY-OPEN retriever; return {summary, rows}. Factored
+    out of run() so the #11 matrix can score per-(task-type) slices without re-opening the index.
+    `score_impact=False` skips the caller-edge metrics (per-type slices, where impact is its own
+    bucket). When score_impact=True, impact_gold=None falls back to gold.IMPACT_GOLD — exactly
+    the dogfood run's long-standing behaviour (so run() stays byte-identical on existing metrics).
+    Does NOT close the retriever; the caller owns its lifecycle."""
     n = len(gold)
     file_hits = {1: 0, 3: 0, 5: 0}
     sym_hit5 = 0
     mrr_sum = 0.0
+    recall_sum = 0.0
     pack_tok_sum = 0
     cards_tok_sum = 0
     dup_repeat = 0
@@ -157,7 +212,7 @@ def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
 
     for item in gold:
         q = item["q"]
-        results = retriever.search(q, top_k=TOP_K)
+        results = retriever.search(q, top_k=TOP_K, mode=mode)
         f_rank = _first_rank(results, item["files"], "path")
         s_rank = _first_rank(results, item.get("symbols", []), "symbol_name")
 
@@ -167,6 +222,7 @@ def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
         if s_rank is not None and s_rank < 5:
             sym_hit5 += 1
         mrr_sum += (1.0 / (f_rank + 1)) if f_rank is not None else 0.0
+        recall_sum += _recall_at_k(results, item["files"], "path", 5)
 
         pack = packer.build(q, token_budget=4000)
         pack_tok = counter.count(pack)
@@ -228,8 +284,6 @@ def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
                      "pack_tokens": pack_tok, "cards_tokens": cards_tok,
                      "fetches": fetched if resolved_ok else None})
 
-    retriever.close()
-
     summary = {
         "queries": n,
         "precision_at_1": round(file_hits[1] / n, 3),
@@ -237,6 +291,7 @@ def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
         "precision_at_5": round(file_hits[5] / n, 3),
         "symbol_precision_at_5": round(sym_hit5 / n, 3),
         "mrr": round(mrr_sum / n, 3),
+        "recall_at_5": round(recall_sum / n, 3),
         "avg_pack_tokens": round(pack_tok_sum / n, 1),
         "avg_cards_tokens": round(cards_tok_sum / n, 1),
         "token_savings_cards_vs_pack": round(1 - cards_tok_sum / max(pack_tok_sum, 1), 3),
@@ -252,15 +307,30 @@ def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
                                         if same_name_cases else 0.0),
         "same_name_cases": same_name_cases,
     }
-    summary.update(_impact_fp_fn(settings, impact_gold))
+    if score_impact:
+        summary.update(_impact_fp_fn(settings, impact_gold))
     return {"summary": summary, "rows": rows}
+
+
+def run(repo: str = ".", gold=None, impact_gold=None, settings=None) -> dict:
+    """Dogfood retrieval eval over one query list. Opens the index once, scores, closes.
+    A thin wrapper over _score_queries — output is unchanged from before the matrix refactor
+    (the summary now also carries `recall_at_5`; every pre-existing metric value is untouched)."""
+    gold = gold or GOLD
+    settings = settings or Settings.load(repo)
+    retriever = Retriever(settings)
+    packer = ContextPacker(settings, retriever=retriever)
+    counter = TokenCounter(settings.section("context_pack").get("tokenizer", "cl100k_base"))
+    result = _score_queries(retriever, packer, counter, settings, gold, impact_gold)
+    retriever.close()
+    return result
 
 
 def _print(result: dict) -> None:
     s = result["summary"]
     print("=== Retrieval eval ===")
     for key in ("queries", "precision_at_1", "precision_at_3", "precision_at_5",
-                "symbol_precision_at_5", "mrr", "avg_pack_tokens", "avg_cards_tokens",
+                "symbol_precision_at_5", "mrr", "recall_at_5", "avg_pack_tokens", "avg_cards_tokens",
                 "token_savings_cards_vs_pack", "same_path_repeat_rate",
                 "duplicate_card_rate", "fetches_to_resolution", "resolution_rate",
                 "ambiguous_ref_rate", "wrong_symbol_same_name_rate", "same_name_cases",
@@ -294,6 +364,8 @@ _GATE_SPEC = [
     ("edge_precision", "up", True),          # caller-edge precision (1 - fp_rate)
     ("edge_recall", "up", True),             # caller-edge recall (1 - fn_rate)
     ("impact_exact_case_rate", "up", True),  # "found the correct edit site" per symbol
+    ("tests_precision", "up", True),         # #11 test-selection precision (skipped if absent)
+    ("tests_recall", "up", True),            # #11 test-selection recall
     ("wrong_symbol_same_name_rate", "down", True),
     ("duplicate_card_rate", "down", True),
     ("ambiguous_ref_rate", "down", True),
@@ -301,6 +373,7 @@ _GATE_SPEC = [
     ("precision_at_3", "up", True),
     ("precision_at_5", "up", True),
     ("mrr", "up", True),
+    ("recall_at_5", "up", True),             # #11 feature / API-refactor multi-site coverage
     ("resolution_rate", "up", True),
     ("avg_cards_tokens", "down", False),   # token budget is the edge (#17) — warn, don't block
     ("avg_pack_tokens", "down", False),
@@ -331,6 +404,193 @@ def gate(summary: dict, baseline: dict) -> bool:
         print(f"  {metric:30s} {base:9.3f} {cur:9.3f} {delta:+9.3f}  {verdict}")
     print(f"\n  GATE: {'PASS' if hard_ok else 'FAIL — a hard metric regressed vs baseline'}")
     return hard_ok
+
+
+# ---------------------------------------------------------------------------
+# #11 eval matrix — {language × task-type} deterministic retrieval over vendored fixtures.
+#
+# ROADMAP.md:72-78. The matrix that "doesn't exist yet": run a TYPED task set per fixture repo,
+# slice metrics by the 6 task types, and report a {language × type} table that the modes presets
+# and the M3 gate can finally be proven against. Deterministic (fixed source + pinned model);
+# each fixture is re-indexed fresh (.pandemonium is gitignored — nothing committed), the cpp_eval
+# pattern. NOT an agent-level A/B — pure retrieval metrics, so it is gate-able.
+# ---------------------------------------------------------------------------
+# Headline proxy metric shown per task-type column (the cell value); the full sub-summary is in
+# matrix_result.json. discovery/bugtrace = ranking; feature/refactor = multi-site coverage;
+# impact = caller-edge recall; testsel = test-selection recall.
+_MATRIX_COLS = ("discovery", "bugtrace", "feature", "refactor", "impact", "testsel")
+_MATRIX_PROXY = {"discovery": "mrr", "bugtrace": "mrr", "feature": "recall_at_5",
+                 "refactor": "recall_at_5", "impact": "edge_recall", "testsel": "tests_recall"}
+
+
+def run_typed(repo: str, queries, impact_gold, tests_gold, settings=None, mode=None) -> dict:
+    """Score one fixture's typed task set; return {overall, by_type:{type: sub_summary}}.
+    The 4 search-shaped types (discovery/bugtrace/feature/refactor) are bucketed from `queries`
+    and scored by ranking; known-symbol impact and test selection are mono-type buckets scored
+    once by _impact_fp_fn / _tests_pr. The index is opened ONCE and reused across slices.
+    `mode` selects a per-call ranking-weight preset for the search-shaped types (impact graph +
+    find_tests are mode-independent)."""
+    from collections import defaultdict
+    settings = settings or Settings.load(repo)
+    retriever = Retriever(settings)
+    packer = ContextPacker(settings, retriever=retriever)
+    counter = TokenCounter(settings.section("context_pack").get("tokenizer", "cl100k_base"))
+
+    groups = defaultdict(list)
+    for item in queries:
+        groups[item.get("type", "untyped")].append(item)
+
+    by_type = {}
+    for t, qs in groups.items():
+        by_type[t] = _score_queries(retriever, packer, counter, settings, qs,
+                                    score_impact=False, mode=mode)["summary"]
+    # `impact_gold or []` (never None) so the overall does NOT fall back to dogfood IMPACT_GOLD.
+    overall = _score_queries(retriever, packer, counter, settings, queries,
+                             impact_gold=impact_gold or [], mode=mode)["summary"]
+    retriever.close()
+
+    if impact_gold:
+        by_type["impact"] = _impact_fp_fn(settings, impact_gold)
+    if tests_gold:
+        by_type["testsel"] = _tests_pr(settings, tests_gold)
+    return {"overall": overall, "by_type": by_type}
+
+
+def _render_matrix(out: dict) -> None:
+    print("\n=== #11 eval matrix — {language × task-type} ===")
+    print(f"  {'language':12s}" + "".join(f"{c[:9]:>10s}" for c in _MATRIX_COLS))
+    for lang, block in out.items():
+        cells = []
+        for c in _MATRIX_COLS:
+            summ, key = block["by_type"].get(c), _MATRIX_PROXY[c]
+            cells.append(f"{summ[key]:>10.3f}" if summ and key in summ else f"{'-':>10s}")
+        print(f"  {lang:12s}" + "".join(cells))
+    print("  legend: discovery/bugtrace=MRR  feature/refactor=recall@5  impact=edge_recall  "
+          "testsel=tests_recall")
+
+
+def matrix_eval(manifest_path: str) -> dict:
+    """Run the #11 matrix from a manifest of vendored fixtures. Each entry indexes its fixture
+    fresh with the real model, then scores per task type. Writes matrix_result.json beside the
+    manifest. Manifest: {"matrix": [{language, repo_path, tasks_file}]} with repo-root-relative
+    paths (or a bare list of such entries)."""
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    entries = manifest["matrix"] if isinstance(manifest, dict) else manifest
+    root = Path(__file__).parent.parent  # repo root; manifest paths are repo-relative
+    out = {}
+    print("=== #11 eval matrix (deterministic retrieval; fresh real-model index per fixture) ===")
+    for entry in entries:
+        lang = entry["language"]
+        repo_path = str((root / entry["repo_path"]).resolve())
+        tasks_file = str((root / entry["tasks_file"]).resolve())
+        queries, impact_gold, tests_gold = load_tasks(tasks_file)
+        settings = Settings.load(repo_path)
+        stats = service.index(settings, incremental=False)  # real model, fresh
+        print(f"  [{lang}] indexed files={stats.indexed} symbols={stats.symbols}  {entry['repo_path']}")
+        out[lang] = run_typed(repo_path, queries, impact_gold, tests_gold, settings=settings)
+    _render_matrix(out)
+    art = Path(manifest_path).parent / "matrix_result.json"
+    art.write_text(json.dumps(out, indent=2), encoding="utf-8")
+    print(f"\nwrote {art}")
+    return out
+
+
+def matrix_gate(result: dict, baseline: dict) -> bool:
+    """Gate every per-language `overall` + per-task-type leaf against a saved matrix baseline,
+    reusing gate() (which skips any metric absent from either side). FAIL if any HARD leaf
+    regressed. A leaf missing from the baseline can't regress, so first-time leaves pass."""
+    ok = True
+    for lang, block in result.items():
+        base = baseline.get(lang, {})
+        print(f"\n--- matrix gate [{lang}] overall ---")
+        ok = gate(block["overall"], base.get("overall", {})) and ok
+        for t, summ in block["by_type"].items():
+            print(f"--- matrix gate [{lang}] {t} ---")
+            ok = gate(summ, base.get("by_type", {}).get(t, {})) and ok
+    print(f"\n  MATRIX GATE: {'PASS' if ok else 'FAIL — a hard metric regressed in some leaf'}")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# #11 matrix ARMS — run the matrix under config-override arms (the gated reranker signals; the
+# per-call mode presets) over the SAME fresh index per fixture, and report each arm's delta vs
+# base, per (language × task-type).
+#
+# DISCIPLINE: the vendored fixtures are small + self-authored (6 queries each). This is the
+# does-it-HURT / no-regression gate and a DIRECTIONAL signal only — NOT a ship decision. A ship
+# requires the external-repo crossover (crossover_eval / a large external --tasks set), never this
+# gold. rerank/mode change SEARCH ranking only, so the impact (graph) and testsel (FTS) columns
+# are mode/rerank-invariant by construction — expect '.' there.
+# ---------------------------------------------------------------------------
+_RERANK_ARMS = [
+    ("base",           {},                                                               None),
+    ("rerank:prose",   {"rerank": True, "rerank_prose": True,  "rerank_density": False}, None),
+    ("rerank:density", {"rerank": True, "rerank_prose": False, "rerank_density": True},  None),
+    ("rerank:both",    {"rerank": True, "rerank_prose": True,  "rerank_density": True},  None),
+]
+_MODE_ARMS = [
+    ("base",           {}, None),
+    ("mode:impact",    {}, "impact"),
+    ("mode:discovery", {}, "discovery"),
+    ("mode:bugfix",    {}, "bugfix"),
+]
+
+
+def _run_arm(repo_path, queries, impact_gold, tests_gold, override, mode):
+    settings = Settings.load(repo_path)
+    if override:
+        settings.data["retrieval"].update(override)
+    return run_typed(repo_path, queries, impact_gold, tests_gold, settings=settings, mode=mode)
+
+
+def _render_arms(out: dict, labels) -> None:
+    base_label = labels[0]
+    langs = list(out[base_label].keys())
+    for label in labels[1:]:
+        print(f"\n  --- arm '{label}' vs '{base_label}' (delta of headline proxy per cell) ---")
+        print(f"  {'language':12s}" + "".join(f"{c[:9]:>10s}" for c in _MATRIX_COLS))
+        any_move = False
+        for lang in langs:
+            cells = []
+            for c in _MATRIX_COLS:
+                key = _MATRIX_PROXY[c]
+                a, b = out[label][lang]["by_type"].get(c), out[base_label][lang]["by_type"].get(c)
+                if a and b and key in a and key in b:
+                    d = a[key] - b[key]
+                    if abs(d) > _EPS:
+                        any_move = True
+                    cells.append(f"{d:>+10.3f}" if abs(d) > _EPS else f"{'.':>10s}")
+                else:
+                    cells.append(f"{'-':>10s}")
+            print(f"  {lang:12s}" + "".join(cells))
+        if not any_move:
+            print("  (no cell moved vs base)")
+    print("\n  legend: '.' = no change, +/- = delta vs base, '-' = absent. "
+          "discovery/bugtrace=MRR  feature/refactor=recall@5  impact=edge_recall  testsel=tests_recall")
+
+
+def matrix_arms_eval(manifest_path: str, arms, title: str) -> dict:
+    """Run the #11 matrix under `arms` over ONE fresh index per fixture (rerank/mode are
+    retrieval-time, so the index is built once and reused). Prints per-cell deltas vs the base
+    arm. Returns {label: {language: run_typed_result}}. Directional / no-regression only."""
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    entries = manifest["matrix"] if isinstance(manifest, dict) else manifest
+    root = Path(__file__).parent.parent
+    out = {label: {} for label, _, _ in arms}
+    print(f"\n=== #11 matrix ARMS — {title} "
+          "(directional / does-it-hurt only; NOT a ship gate — ship needs external crossover) ===")
+    for entry in entries:
+        lang = entry["language"]
+        repo_path = str((root / entry["repo_path"]).resolve())
+        tasks_file = str((root / entry["tasks_file"]).resolve())
+        queries, impact_gold, tests_gold = load_tasks(tasks_file)
+        settings = Settings.load(repo_path)
+        stats = service.index(settings, incremental=False)  # index once; arms reuse it
+        print(f"  [{lang}] indexed files={stats.indexed} symbols={stats.symbols}")
+        for label, override, mode in arms:
+            out[label][lang] = _run_arm(repo_path, queries, impact_gold, tests_gold, override, mode)
+    _render_arms(out, [a[0] for a in arms])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -944,14 +1204,23 @@ if __name__ == "__main__":
                     help="path to a 2-class task file {buried, control}; the OFF-DOGFOOD rerank "
                          "ship gate. Indexes --repo fresh (real model) — point it at an external "
                          "repo/fixture, not the main repo")
+    ap.add_argument("--matrix", default=None,
+                    help="path to evals/fixtures/matrix/manifest.json; run the #11 "
+                         "per-(language x task-type) deterministic retrieval matrix over the "
+                         "vendored fixtures (indexes each fresh). Pair with --save/--gate <label>")
+    ap.add_argument("--matrix-arms", default=None,
+                    help="path to the matrix manifest; run the matrix under config arms (the "
+                         "gated reranker signals AND the mode presets) over one index per fixture "
+                         "and print per-cell deltas vs base. DIRECTIONAL / no-regression only — "
+                         "not a ship gate (ship needs the external crossover)")
     ap.add_argument("--gate", default=None,
                     help="label -> compare to evals/<label>.json; exit 1 if a hard "
                          "metric regressed (M1 lock + M3 acceptance gate)")
     args = ap.parse_args()
 
-    gold = impact_gold = None
+    gold = impact_gold = tests_gold = None
     if args.tasks:
-        gold, impact_gold = load_tasks(args.tasks)
+        gold, impact_gold, tests_gold = load_tasks(args.tasks)
 
     if args.perquery:
         perquery(args.repo, gold=gold, impact_gold=impact_gold)
@@ -977,6 +1246,23 @@ if __name__ == "__main__":
         modes_eval(args.repo)
     elif args.sweep:
         sweep(args.repo)
+    elif args.matrix_arms:
+        matrix_arms_eval(args.matrix_arms, _RERANK_ARMS, "gated structural reranker signals")
+        matrix_arms_eval(args.matrix_arms, _MODE_ARMS, "per-call mode presets")
+    elif args.matrix:
+        result = matrix_eval(args.matrix)
+        if args.save:
+            out = Path(__file__).parent / f"{args.save}.json"
+            out.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            print(f"\nwrote {out}")
+        if args.gate:
+            base_path = Path(__file__).parent / f"{args.gate}.json"
+            if not base_path.exists():
+                print(f"\ngate baseline not found: {base_path}")
+                sys.exit(2)
+            baseline = json.loads(base_path.read_text(encoding="utf-8"))
+            if not matrix_gate(result, baseline):
+                sys.exit(1)
     else:
         result = run(args.repo, gold=gold, impact_gold=impact_gold)
         _print(result)

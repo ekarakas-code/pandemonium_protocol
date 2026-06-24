@@ -460,6 +460,69 @@ verdict that scoped this as the one "adopt now" item.
 - **New metrics in `run_eval.py`**: `edge_precision`, `edge_recall` (micro-averaged over all gold
   callers) and `impact_exact_case_rate` (fraction of symbols where the tool returned ALL and ONLY
   the real callers — stricter than the micro rates; the per-symbol "correct edit site" signal).
+
+## #11 eval matrix — deterministic-retrieval half (2026-06-24)
+
+**The gap this closes.** The "matrix that doesn't exist yet" referenced throughout the modes /
+crossover sections above now exists for the *retrieval-metric* layer. `evals/run_eval.py --matrix`
+runs `{cpp · c_sharp · typescript} × {discovery · bugtrace · feature · refactor · impact · testsel}`
+over three vendored fixture mini-repos (`evals/fixtures/matrix/{cpp_app,dotnet_app,ts_app}`), each
+indexed FRESH with the real model (`.pandemonium` gitignored — nothing committed; the `cpp_eval`
+pattern). Deterministic (re-run → zero deltas), so it gates against `evals/matrix_baseline.json`.
+
+**First measured matrix** (headline proxy per cell — discovery/bugtrace=MRR, feature/refactor=recall@5,
+impact=edge_recall, testsel=tests_recall):
+
+| language   | discovery | bugtrace | feature | refactor | impact | testsel |
+|------------|-----------|----------|---------|----------|--------|---------|
+| cpp        | 1.000     | 1.000    | 1.000   | 0.667    | 1.000  | 1.000   |
+| c_sharp    | 0.750     | 1.000    | 0.667   | 0.333    | 1.000  | 1.000   |
+| typescript | 1.000     | 0.750    | 1.000   | 1.000    | 1.000  | 1.000   |
+
+**Honest read.** impact / testsel / feature resolve strongly across all three languages (the
+unique-name graph fidelity + test-token discipline hold). **refactor is the measured weak spot**
+(0.333–0.667): embedding search surfaces an API's *definition* but not all its *call sites* — that
+is `repo_impact`'s job, not vector ranking. The fixtures are honest regression LOCKS, not tuning
+targets — queries are intent-phrased, and one C# interface doc comment that had been worded to mirror
+its feature query was rewritten to a domain-neutral description (c_sharp feature 1.000 → 0.667, the
+honest number) before baselining.
+
+**Scope / what this does NOT close.** Retrieval metrics only — NO agent-level token/error A/B (the
+real M3 proof; extends `qa_ab_runner.py`) and NO large *external* repos yet (vendored fixtures are
+small + synthetic). Both are unblocked by the typed gold this lands. The dogfood `--gate baseline`
+stays RED for the unrelated, documented retrieval-ranking regression above — independent of this work.
+
+### Reranker + modes through the matrix (`--matrix-arms`, 2026-06-24)
+
+Ran the gated structural reranker signals and the per-call mode presets through the matrix
+(one fresh index per fixture; arms reuse it). **Directional / no-regression only — NOT a ship
+decision** (n=6 per fixture, self-authored; ship needs the external crossover).
+
+- **Reranker (prose / density / both): ZERO movement on every cell.** Confirmed NOT a bug — the
+  same reranker on its purpose-built prose fixture passes its crossover (`--crossover` on
+  `rerank_crossover`: buried MRR 0.225→0.600, control 1.0→1.0, PASS). The #11 fixtures are
+  **code-only with gold already at rank 0–1**, so there is nothing for `rerank_prose` (demote
+  prose) / `rerank_density` (demote bulk-data) to act on. ⇒ this is a clean **no-regression
+  OBSERVATION** (rerank-on == rerank-off on every cell today) but gives **no win signal** — and it
+  is NOT enforced: the matrix gate runs `rerank=OFF` (the default), so nothing locks a future
+  reranker change out of the cells. The reranker decision stays 100% on the external crossover.
+  (To make the matrix probe the reranker, the fixtures would need prose-doc +
+  bulk-constant distractor cards — deliberately omitted to keep them from becoming a rerank-tuning
+  gold.)
+- **Modes — weak/mixed directional signal.** `mode:discovery` is mildly on-thesis (helps the
+  discovery slice: c_sharp +0.250 MRR; +0.334 c_sharp refactor, +0.250 ts bugtrace; neutral
+  elsewhere). `mode:impact` HURTS discovery (−0.25…−0.375, expected — it favours exact-symbol),
+  and its *win* is **untestable here** because the matrix's impact column is graph-scored
+  (mode-invariant), not search. `mode:bugfix` shows no benefit on bug-trace and some harm
+  (ts bugtrace −0.083, ts feature −0.333) — consistent with the standing "bugfix premise is thin
+  without distinctive error literals" (our bug-trace queries are semantic, not literal-token).
+  ⇒ modes remain **UNVALIDATED**; to validate via the matrix it needs impact-INTENT *search*
+  queries (so impact-mode has an on-target column) and literal-token bug-trace gold (to exercise
+  bugfix/bm25). Otherwise validation is via external repos.
+
+**Net:** the vendored matrix has done its job (regression lock + arms machinery validated); for
+BOTH the reranker and the modes the next real step is the **external-repo crossover** — the
+fixtures are too small/synthetic to be the ship gold, by the project's own discipline.
   All three are **hard-gated**; `impact_fp/fn` retained.
 - **`--perquery` now prints per-symbol caller-edge detail** (got vs gold, missing=FN, extra=FP) —
   the adjudication tool for deciding whether a non-zero FP/FN is a real tool limit or a stale gold.

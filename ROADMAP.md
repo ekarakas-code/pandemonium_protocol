@@ -72,6 +72,11 @@ The change from the v1 order: **eval harness + trust-gating move ahead of brief/
 - **#11 eval matrix:** {this C++ repo · one .NET · one TS} × {known-symbol impact · vague
   discovery · bug trace · feature · API refactor · test selection}. Repo-agnostic ≠
   repo-blind. Every N=1 claim in our test needs N≥3 before scoring work. Builds on `evals/`.
+  - **STATUS 2026-06-24 — deterministic-retrieval half BUILT.** `evals/run_eval.py --matrix`
+    over three vendored fixtures (`evals/fixtures/matrix/{cpp_app,dotnet_app,ts_app}`) scores
+    all 6 task types per language and gates against `evals/matrix_baseline.json` (a fresh
+    real-model index per fixture; deterministic). Still pending: the agent-level token/error
+    A/B (the M3 half, extends `qa_ab_runner.py`) and large *external* repos via `--tasks`.
 - **M1 caller-graph regression assertion:** standing check that `impact(computeStepFromVelocity)`
   on SomeStrategyGame contains its real SIMD steppers / `runMovementScalar` — the
   nested-namespace edge-drop broke this silently for months; lock it so a future protocol

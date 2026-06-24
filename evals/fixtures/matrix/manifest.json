@@ -1,0 +1,8 @@
+{
+  "_doc": "#11 eval matrix manifest. Each entry = a vendored fixture mini-repo + its typed task file. Paths are repo-root-relative. The matrix runner indexes each fixture fresh with the real model (.pandemonium is gitignored, nothing committed), then scores per task type. `language` is a display/key label (matches language_detector labels); indexing is by file extension.",
+  "matrix": [
+    {"language": "cpp", "repo_path": "evals/fixtures/matrix/cpp_app", "tasks_file": "evals/fixtures/matrix/cpp_app/tasks.json"},
+    {"language": "c_sharp", "repo_path": "evals/fixtures/matrix/dotnet_app", "tasks_file": "evals/fixtures/matrix/dotnet_app/tasks.json"},
+    {"language": "typescript", "repo_path": "evals/fixtures/matrix/ts_app", "tasks_file": "evals/fixtures/matrix/ts_app/tasks.json"}
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "_doc": "TS matrix fixture. dispatchEvent is a class METHOD (real, not arrow-field). normalizePayload is a MODULE arrow-const (extracted). Channel.deliver not reused as an impact target.",
+  "queries": [
+    {"q": "how does an incoming event get fanned out to all subscribers", "files": ["src/core/dispatcher.ts"], "symbols": ["dispatchEvent"], "type": "discovery"},
+    {"q": "where are handlers registered and resolved for a channel", "files": ["src/core/registry.ts"], "symbols": ["resolveAll", "register"], "type": "discovery"},
+    {"q": "dispatch handler threw for envelope id error log", "files": ["src/diagnostics/logger.ts"], "symbols": [], "type": "bugtrace"},
+    {"q": "where is the error logged when a handler fails", "files": ["src/diagnostics/logger.ts"], "symbols": ["logError"], "type": "bugtrace"},
+    {"q": "add a new delivery channel by implementing the channel interface", "files": ["src/core/types.ts", "src/channels/emailChannel.ts", "src/channels/smsChannel.ts"], "symbols": ["Channel", "EmailChannel"], "type": "feature"},
+    {"q": "everywhere the event payload is normalized before delivery", "files": ["src/transform/normalize.ts", "src/core/dispatcher.ts", "src/transform/redact.ts"], "symbols": ["normalizePayload"], "type": "refactor"}
+  ],
+  "impact": [
+    {"ref": "src/core/dispatcher.ts::EventDispatcher.dispatchEvent",
+     "true_direct": ["src/core/registry.ts::HandlerRegistry.register",
+                     "src/core/registry.ts::HandlerRegistry.resolveAll"],
+     "type": "impact"}
+  ],
+  "tests": [
+    {"target": "dispatchEvent", "expected_tests": ["tests/dispatcher.test.ts"], "type": "testsel"},
+    {"target": "normalizePayload", "expected_tests": ["tests/normalize.test.ts"], "type": "testsel"}
+  ]
+}

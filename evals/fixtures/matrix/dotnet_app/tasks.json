@@ -1,0 +1,21 @@
+{
+  "_doc": "C# matrix fixture. Block namespaces -> Orders.Services.Class.Method qnames. SettleInvoice/ComputeTaxableTotal globally unique. IPricingRule.Apply not reused as an impact target.",
+  "queries": [
+    {"q": "where is the order total finalized when a customer checks out", "files": ["src/Services/CheckoutService.cs"], "symbols": ["SettleInvoice"], "type": "discovery"},
+    {"q": "how is an order recalculated from its line items", "files": ["src/Domain/Order.cs"], "symbols": ["Recalculate"], "type": "discovery"},
+    {"q": "checkout settle negative balance after discount audit entry", "files": ["src/Diagnostics/AuditLog.cs"], "symbols": [], "type": "bugtrace"},
+    {"q": "where is the audit log line written for a settlement failure", "files": ["src/Diagnostics/AuditLog.cs"], "symbols": ["Write"], "type": "bugtrace"},
+    {"q": "add a new pricing discount by implementing the pricing rule interface", "files": ["src/Pricing/IPricingRule.cs", "src/Pricing/BulkDiscountRule.cs", "src/Pricing/SeasonalRule.cs"], "symbols": ["IPricingRule", "Apply"], "type": "feature"},
+    {"q": "all the places that compute an order's taxable total", "files": ["src/Services/TaxCalculator.cs", "src/Services/CheckoutService.cs", "src/Services/OrderProcessor.cs"], "symbols": ["ComputeTaxableTotal"], "type": "refactor"}
+  ],
+  "impact": [
+    {"ref": "src/Services/CheckoutService.cs::Orders.Services.CheckoutService.SettleInvoice",
+     "true_direct": ["src/Services/OrderProcessor.cs::Orders.Services.OrderProcessor.ProcessBatch",
+                     "src/Services/OrderProcessor.cs::Orders.Services.OrderProcessor.RetryFailed"],
+     "type": "impact"}
+  ],
+  "tests": [
+    {"target": "SettleInvoice", "expected_tests": ["tests/CheckoutServiceTests.cs"], "type": "testsel"},
+    {"target": "ComputeTaxableTotal", "expected_tests": ["tests/TaxCalculatorTests.cs"], "type": "testsel"}
+  ]
+}

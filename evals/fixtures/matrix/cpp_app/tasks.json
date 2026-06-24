@@ -1,0 +1,21 @@
+{
+  "_doc": "C++ matrix fixture. Impact target nested-block-namespaced engine::core, unique name (M1 lock). All gold symbols inline/namespaced free fns -> dotted qnames.",
+  "queries": [
+    {"q": "how does the simulation advance the world by one frame", "files": ["src/core/simulation.cpp"], "symbols": ["stepSimulation"], "type": "discovery"},
+    {"q": "where is the per-frame tick loop that updates every system", "files": ["src/core/scheduler.cpp"], "symbols": ["runFrame"], "type": "discovery"},
+    {"q": "AABB overlap underflow when resolving a collision pair", "files": ["src/systems/collision_system.cpp"], "symbols": [], "type": "bugtrace"},
+    {"q": "logger that emits the diagnostic for a failed collision", "files": ["src/diagnostics/logger.cpp"], "symbols": ["emit"], "type": "bugtrace"},
+    {"q": "add a new behavior by implementing the system interface update hook", "files": ["include/engine/system.hpp", "src/systems/movement_system.cpp", "src/systems/render_system.cpp"], "symbols": ["ISystem", "update"], "type": "feature"},
+    {"q": "every place that integrates motion to advance physics state", "files": ["src/physics/integrator.cpp", "src/systems/movement_system.cpp", "src/core/scheduler.cpp"], "symbols": ["integrateMotion"], "type": "refactor"}
+  ],
+  "impact": [
+    {"ref": "src/core/simulation.cpp::engine.core.stepSimulation",
+     "true_direct": ["src/core/scheduler.cpp::engine.core.runFrame",
+                     "src/core/scheduler.cpp::engine.core.tickSystems"],
+     "type": "impact"}
+  ],
+  "tests": [
+    {"target": "stepSimulation", "expected_tests": ["tests/test_simulation.cpp"], "type": "testsel"},
+    {"target": "integrateMotion", "expected_tests": ["tests/test_integrator.cpp"], "type": "testsel"}
+  ]
+}

@@ -22,6 +22,10 @@ ENV/
 # Matches the live store and any nested fixture/stray indexes at every level.
 .pandemonium/
 
+# #11 eval matrix: regenerated per run by `run_eval.py --matrix` (the durable lock is
+# evals/matrix_baseline.json, which IS tracked); the latest run artifact is not.
+evals/fixtures/matrix/matrix_result.json
+
 # --- OS cruft ---
 .DS_Store
 Thumbs.db

@@ -1,0 +1,16 @@
+{
+  "name": "event-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Small event / notification dispatch pipeline (eval fixture)",
+  "type": "module",
+  "main": "src/app/main.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

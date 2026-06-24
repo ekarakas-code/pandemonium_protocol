@@ -107,8 +107,9 @@ DEFAULTS: dict[str, Any] = {
         # scope=symbol-only, so modes never touch scope/chunk-type). Selected per call via
         # mode=; absent/unknown -> the default weights above. The presets are PRINCIPLED but
         # NOT yet validated: a mode is only proven by *differential* (crossover) performance
-        # across query types, which needs the #11 multi-type/multi-repo matrix that doesn't
-        # exist yet. Until then they ship as labelled hypotheses (see evals --modes / RESULTS).
+        # across query types. The #11 multi-type/multi-repo matrix that enables that is now
+        # built (evals/run_eval.py --matrix over evals/fixtures/matrix/), but the modes-crossover
+        # run THROUGH it is still pending; until then they ship as labelled hypotheses.
         #   impact   — editing a known-ish symbol: favour exact symbol matches.
         #   discovery— vague "where do we X": favour semantic (vector) recall.
         #   bugfix   — trace a literal token (error/log): favour keyword/bm25. (Premise is
