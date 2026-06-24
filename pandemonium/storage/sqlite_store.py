@@ -414,6 +414,14 @@ class SqliteStore:
         return self.conn.execute(
             "SELECT * FROM relationships WHERE source_id=?", (source_id,)).fetchall()
 
+    def relationships_by_type(self, repo_id: str,
+                              relationship_type: str) -> list[sqlite3.Row]:
+        """All edges of one relationship_type across the repo (one query vs N per-symbol
+        out_edges) — used by the architectural-skeleton builder to aggregate call direction."""
+        return self.conn.execute(
+            "SELECT * FROM relationships WHERE repo_id=? AND relationship_type=?",
+            (repo_id, relationship_type)).fetchall()
+
     def edges_by_target_name(self, repo_id: str, name: str,
                              relationship_type: str = "calls") -> list[sqlite3.Row]:
         return self.conn.execute(

@@ -62,6 +62,19 @@ DEFAULTS: dict[str, Any] = {
         # matching out-of-line `.cpp` definition. Off-switch for the per-file sibling-header
         # probe; a no-op for non-C++ and for translation units with no sibling header.
         "cpp_header_merge": True,
+        # Module-body / complement card (Improvements6 T2). OFF by default. For a file WITH
+        # symbols, also emit a card for the residue BETWEEN symbol spans (imports, app wiring,
+        # DI/CLI/__main__ blocks, top-level statements) — findable by nothing today. Covers only
+        # the gaps (never a symbol span), so the Phase-4 'code'-overlap failure can't recur.
+        # Flagged partial/unsafe-to-reason-from. Awaits A/B proof (net token-saving) before on.
+        "complement_card": False,
+        "complement_min_lines": 4,  # min non-blank lines in a gap before it earns a card
+        # Resident architectural skeleton (Improvements6-part2 #3). OFF by default. At index
+        # time, emit a compact module-roles + dependency-direction map into CLAUDE.md between
+        # stable markers (regenerated in place). DECOUPLED artifact: goes stale between indexes
+        # (carries a freshness stamp + 'believed-then' label) and spends resident token budget
+        # every session. Only the explicit `index` path emits it (not MCP auto-reindex).
+        "emit_skeleton": False,
     },
     "retrieval": {
         # The per-call task mode is a parameter (CLI --mode / MCP arg), not a config default;
@@ -84,6 +97,12 @@ DEFAULTS: dict[str, Any] = {
         "rerank": False,
         "rerank_prose": True,
         "rerank_density": True,
+        # Post-edit static breakage check (repo_check / `pandemonium check`). OFF by default.
+        # Reports a FLOOR of compiler-catchable breakage from edits NOT yet indexed (removed/
+        # renamed callees, changed signatures, dangling imports) and declares in-band what it
+        # cannot see (dynamic dispatch, reflection, cross-language, framework-registered calls,
+        # and the symmetric A-mis-calls-B case). Awaits A/B proof before default-on.
+        "breakage_check": False,
         # Auto-indexer (server self-heal): read tools incrementally reindex files changed
         # since the last check before serving, so mid-session edits are reflected without a
         # manual repo_reindex_changed. Debounced by auto_reindex_min_interval seconds (a

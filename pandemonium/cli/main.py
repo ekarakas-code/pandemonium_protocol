@@ -238,6 +238,15 @@ def impact(ref: str, repo: str = _REPO_OPT) -> None:
 
 
 @app.command()
+def check(target: str = typer.Argument(""), repo: str = _REPO_OPT) -> None:
+    """Post-edit breakage FLOOR: call-sites whose callee was removed/renamed, changed
+    signatures, dangling imports — for edits not yet indexed. Gated: retrieval.breakage_check."""
+    settings = Settings.load(repo)
+    from pandemonium.breakage import render_breakage
+    typer.echo(render_breakage(service.breakage(settings, target or None)))
+
+
+@app.command()
 def plan(ref: str, repo: str = _REPO_OPT) -> None:
     """Edit plan for a ref: target, callers, tests, deps, risks, and fetch order."""
     settings = Settings.load(repo)

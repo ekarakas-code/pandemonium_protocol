@@ -119,6 +119,7 @@ class ToolContext:
         "repo_map", "repo_search", "repo_symbol", "repo_get", "repo_context_pack",
         "repo_find_tests", "repo_reindex_changed", "repo_session", "repo_graph",
         "repo_impact", "repo_edit_plan", "repo_logic_map", "repo_brief", "repo_changed",
+        "repo_check",
     )
 
     def __init__(self, settings, embedder=None):
@@ -166,8 +167,9 @@ class ToolContext:
             @functools.wraps(raw)
             def wrapper(*args, _name=name, _raw=raw, **kwargs):
                 # Self-heal the index for mid-session edits before any read tool (not the
-                # write tool, which reindexes itself, nor the memory-only session ledger).
-                if _name not in ("repo_reindex_changed", "repo_session"):
+                # write tool, which reindexes itself, nor the memory-only session ledger, nor
+                # repo_check — auto-reindexing would absorb the very edit delta it inspects).
+                if _name not in ("repo_reindex_changed", "repo_session", "repo_check"):
                     self._auto_refresh()
                 trace(f"tool {_name} START")
                 t0 = time.perf_counter()
@@ -350,6 +352,17 @@ class ToolContext:
         if g:  # direct callers are confident edges into this ref
             self.ledger.record_edges([f"{d} -> {g['ref']}" for d in g.get("direct", [])])
         return render_impact(g) if g else f"Ref not found in the graph: {ref}"
+
+    def repo_check(self, target: str = "") -> str:
+        self.audit.log("mcp_tool", tool="repo_check", target=target)
+        if not self.settings.section("retrieval").get("breakage_check", False):
+            from pandemonium.breakage import render_breakage
+            return render_breakage({"status": "disabled"})
+        from pandemonium.breakage import breakage_check, render_breakage
+        result = breakage_check(self.settings, target or None, graph=self.graph_index)
+        for r in result.get("removed", []) + result.get("signature_changed", []):
+            self.ledger.record_edges([f"{c['ref']} -> {r['ref']}" for c in r.get("callers", [])])
+        return render_breakage(result)
 
     def repo_edit_plan(self, ref: str) -> str:
         self.audit.log("mcp_tool", tool="repo_edit_plan", ref=ref)

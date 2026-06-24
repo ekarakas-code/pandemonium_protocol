@@ -94,6 +94,16 @@ def build_server(settings, embedder=None):
         return ctx.repo_impact(ref)
 
     @mcp.tool()
+    def repo_check(target: str = "") -> str:
+        """After editing (before you can run the code), report a FLOOR of compiler-catchable
+        breakage from edits NOT yet indexed: call-sites whose callee was removed/renamed,
+        call-sites of a changed signature, and dangling imports. It is a LOWER BOUND and names
+        what it cannot see (dynamic dispatch, reflection, cross-language, framework-registered
+        calls). target empty = all files changed since index; target = a ref scopes it. Most
+        reliable on the CLI or with retrieval.auto_reindex=false. Gated: retrieval.breakage_check."""
+        return ctx.repo_check(target)
+
+    @mcp.tool()
     def repo_edit_plan(ref: str) -> str:
         """Before editing a symbol, get a ranked change plan: the primary target, direct
         callers to keep compatible, tests to update, dependencies to read, coupling

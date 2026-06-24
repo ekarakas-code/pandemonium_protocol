@@ -69,6 +69,7 @@ def heuristic_tags(path: str, qualified_name: Optional[str], name: Optional[str]
 _SCOPE_BY_CHUNK_TYPE = {
     "class": "symbol", "method": "symbol", "function": "symbol",
     "ast_block": "code", "block": "code", "window": "code", "file": "file",
+    "module_body": "code",  # between-symbol residue card (line-based, code scope)
 }
 
 

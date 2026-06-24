@@ -96,6 +96,44 @@ def _window_chunks(repo_id, file_id, path, language, lines, window_lines, overla
     return chunks
 
 
+def _complement_chunks(repo_id, file_id, path, language, lines, symbols,
+                       min_lines) -> List[Chunk]:
+    """One chunk per non-trivial line-gap NOT covered by any symbol span — the between-symbol
+    residue (imports, app wiring, DI/Startup registration, argparse/CLI blocks, top-level
+    statements) that symbol-only mode leaves findable by nothing. Covers ONLY the gaps (a class
+    span swallows its method gaps), so it never overlaps a symbol and cannot recreate the
+    Phase-4 'code'-scope overlap that lost the bake-off."""
+    total = len(lines)
+    if total == 0 or not symbols:
+        return []
+    # Merge symbol spans (overlapping / nested — a class swallows its methods) into a disjoint
+    # covered set, then take the complement over [1..total].
+    covered: List[Tuple[int, int]] = []
+    for s, e in sorted((sym.start_line, sym.end_line) for sym in symbols):
+        if covered and s <= covered[-1][1]:
+            covered[-1] = (covered[-1][0], max(covered[-1][1], e))
+        else:
+            covered.append((s, e))
+    gaps: List[Tuple[int, int]] = []
+    prev_end = 0
+    for cs, ce in covered:
+        if cs - 1 >= prev_end + 1:
+            gaps.append((prev_end + 1, cs - 1))
+        prev_end = max(prev_end, ce)
+    if prev_end < total:
+        gaps.append((prev_end + 1, total))
+
+    chunks: List[Chunk] = []
+    for gs, ge in gaps:
+        content = _slice(lines, gs, ge)
+        if sum(1 for ln in content.splitlines() if ln.strip()) < min_lines:
+            continue  # blank / comment-only / trivial `if __name__: main()` gaps — no card spam
+        cid = chunk_id_for(file_id, gs, ge, "module_body")
+        chunks.append(Chunk(cid, repo_id, file_id, None, "module_body", language, path,
+                            gs, ge, content, None, sha256_text(content)))
+    return chunks
+
+
 def _file_card(repo_id, file_id, path, language, lines) -> Chunk:
     total = len(lines)
     preview = _slice(lines, 1, min(total, _FILE_PREVIEW_LINES))
@@ -107,7 +145,8 @@ def _file_card(repo_id, file_id, path, language, lines) -> Chunk:
 def build_chunks(repo_id: str, file_id: str, path: str, language: str, text: str,
                  symbols: List[Symbol], scopes: Sequence[str] = DEFAULT_SCOPES,
                  window_lines: int = 60, overlap: int = 10,
-                 subchunk_min_lines: int = 60) -> List[Chunk]:
+                 subchunk_min_lines: int = 60, complement: bool = False,
+                 complement_min_lines: int = 4) -> List[Chunk]:
     lines = text.splitlines()
     chunks: List[Chunk] = []
 
@@ -119,6 +158,9 @@ def build_chunks(repo_id: str, file_id: str, path: str, language: str, text: str
         if "code" in scopes:  # supplementary line-windows for parsed files (bake-off)
             chunks += _window_chunks(repo_id, file_id, path, language, lines,
                                      window_lines, overlap, "window")
+        if complement:  # residue between symbol spans (gated; default off)
+            chunks += _complement_chunks(repo_id, file_id, path, language, lines,
+                                         symbols, complement_min_lines)
     else:
         # Files with no symbols: line-window 'block' chunks are mandatory coverage so
         # docs/config/unsupported langs stay findable regardless of scope config.

@@ -25,7 +25,26 @@ from pandemonium.util import repo_id_for
 
 
 def index(settings, incremental: bool = True) -> IndexStats:
-    return run_index(settings, incremental=incremental)
+    stats = run_index(settings, incremental=incremental)
+    # Gated resident skeleton (indexing.emit_skeleton). Best-effort: a skeleton failure must
+    # NEVER abort or corrupt a successful index. Off by default => byte-identical to before.
+    if settings.section("indexing").get("emit_skeleton", False):
+        try:
+            from pandemonium import skeleton as sk
+            store = SqliteStore(settings.sqlite_path)
+            store.create_schema()
+            try:
+                model = sk.build_skeleton(settings, store)
+                wrote = sk.write_skeleton_into_claude_md(settings.repo_root,
+                                                         sk.render_skeleton(model))
+            finally:
+                store.close()
+            AuditLog(settings.audit_log_path).log("skeleton_emit", wrote=wrote,
+                                                  modules=len(model["modules"]),
+                                                  edges=len(model["edges"]))
+        except Exception as e:  # noqa: BLE001 — never let the skeleton break indexing
+            AuditLog(settings.audit_log_path).log("skeleton_error", error=repr(e))
+    return stats
 
 
 def search(settings, query: str, top_k: Optional[int] = None,
@@ -147,6 +166,16 @@ def impact_for(settings, ref: str):
     AuditLog(settings.audit_log_path).log("repo_impact", surface="cli", ref=ref)
     from pandemonium.graph import repo_impact
     return repo_impact(settings, ref)
+
+
+def breakage(settings, target: str = None) -> dict:
+    """Post-edit static breakage FLOOR (gated: retrieval.breakage_check). target=None => files
+    changed since the index; a 'path::Qualified.Name'/'path' ref => just that symbol/file."""
+    if not settings.section("retrieval").get("breakage_check", False):
+        return {"status": "disabled"}
+    AuditLog(settings.audit_log_path).log("repo_check", surface="cli", target=target)
+    from pandemonium.breakage import breakage_check
+    return breakage_check(settings, target)
 
 
 def edit_plan(settings, ref: str):

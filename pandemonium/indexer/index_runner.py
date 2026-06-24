@@ -40,7 +40,8 @@ _HEADER_EXTS = (".hpp", ".hh", ".hxx", ".h")
 # in _index_file: a partial child/outline/window is is_complete_unit=False; any other full
 # symbol is True. safe_for_reasoning is derived downstream as `is_complete_unit`.
 _UNIT_KIND = {"class": "class_outline", "file": "file_outline"}
-_PARTIAL_CHUNK_TYPES = {"ast_block", "class", "file", "block", "window"}
+# module_body = between-symbol residue grab-bag: a partial unit, never "safe to reason from alone".
+_PARTIAL_CHUNK_TYPES = {"ast_block", "class", "file", "block", "window", "module_body"}
 
 
 def _sibling_headers(abs_path: Path) -> List[Path]:
@@ -256,7 +257,9 @@ class Indexer:
         chunks: List[Chunk] = build_chunks(self.repo_id, fid, cand.rel_path, language,
                                            text, symbols, scopes=scopes,
                                            window_lines=60, overlap=10,
-                                           subchunk_min_lines=idx.get("subchunk_min_lines", 60))
+                                           subchunk_min_lines=idx.get("subchunk_min_lines", 60),
+                                           complement=idx.get("complement_card", False),
+                                           complement_min_lines=idx.get("complement_min_lines", 4))
         sym_by_id = {s.id: s for s in symbols}
         external_summaries = self.settings.section("summaries").get("provider") == "external_llm"
         for c in chunks:
@@ -298,7 +301,7 @@ class Indexer:
             ct = c.chunk_type
             c.unit_kind = _UNIT_KIND.get(ct, ct)
             c.is_complete_unit = ct not in _PARTIAL_CHUNK_TYPES
-            c.requires_imports = ct not in ("file", "block", "window")
+            c.requires_imports = ct not in ("file", "block", "window", "module_body")
             if ct == "ast_block" and sym is not None:
                 c.parent_ref = build_ref(c.path, "symbol", sym.qualified_name or sym.name)
                 c.requires_parent_header = sym.symbol_type == "method"
