@@ -178,6 +178,35 @@ The change from the v1 order: **eval harness + trust-gating move ahead of brief/
   #1/#2/#7.
 - **#15 focused viz — lowest priority** (real, but last).
 
+## Backlog folded from a 2026-06-24 strategic triage
+
+Net-new items from a context-compiler re-prioritization (the rest duplicated this roadmap or was
+already done — the #11 matrix and the M4 health check both landed 2026-06-24). Kept here so this
+stays the single source of truth:
+
+- **Explicit `unknowns` block — cheap, high-value.** `repo_brief` / `repo_edit_plan` shouldn't
+  only separate verified-vs-guess (Step 5) but ENUMERATE the blind spots: "no static edge proves
+  this is unused", "no test covers this symbol", "this is a heuristic tag, not a resolved edge",
+  "dynamic dispatch / DI / reflection / framework-registered / generated code is invisible here."
+  The negative half of the evidence contract; rides on infra already built. (The 2026-06-24
+  breakage check already emits this kind of not-covered floor in-band — apply the same to brief.)
+- **Packer observability — `why_excluded`.** Results carry `why_included` (`reason`); for a bad
+  context pack, also record why NEAR-MISS items were dropped (below budget / dedup / graph-distance
+  / vendor-generated) so a pack is debuggable (parse vs graph vs rank vs budget vs stale).
+- **Hierarchical summaries (HCGS) — net-new, biggest, gated.** file → package → service rollups
+  that are evidence-linked (`supported_by` refs) + staleness-stamped + diff-aware. Ungrounded
+  rollup prose is the confident-liar the principle forbids — sequence after the eval matrix; must
+  clear M3 on external repos. (Partial: the 2026-06-24 CLAUDE.md skeleton is a first repo-level cut.)
+- **Freshness gaps beyond Step 8's header→cpp** — branch-aware index keys; and the
+  mtime-preserving checkout blind spot (some VCS ops leave mtime unchanged, so the hash gate is skipped).
+- **Wire the `affects` producer — deferred, hard-gated.** `ingest_affects` is the only writer and
+  is dormant; the missing piece is a produce→ingest workflow. Keep it a labelled hypothesis channel
+  (confidence + evidence + staleness), never a graph fact. Sequence LAST among synthesis.
+- **Test-impact increment.** Beyond name-matched tests: changed-API → downstream tests, schema/model
+  → serializer tests. Recommend the verification surface; never run it.
+- **Interop, not absorption (discipline).** Don't absorb Serena / codebase-memory-mcp scope; real
+  interop (hand refs to Serena for live symbol validation) is speculative — revisit after Tier 1-2.
+
 ## Success metrics & acceptance
 
 | Metric | Goal |
