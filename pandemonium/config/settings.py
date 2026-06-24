@@ -50,29 +50,22 @@ DEFAULTS: dict[str, Any] = {
         # ALSO split into block-complete `ast_block` children (the full symbol is always kept
         # as one complete card). Below the threshold a symbol stays a single chunk.
         "subchunk_min_lines": 60,
-        # include_tests: NOT read (vestigial) — test files are always scanned + indexed.
-        "include_tests": True,
-        # incremental: NOT read — the incremental/full choice is the `--full` CLI flag
-        # (service.index(incremental=not full)) / the function arg, not this key.
-        "incremental": True,
         "max_file_bytes": 2_000_000,  # skip very large files (reported, not silent)
         # Emitted scopes. Phase-4 bake-off verdict: symbol-primary wins — file-scope
         # cards hurt ranking and code-windows-for-parsed add pure cost (2x overlap, 3x
         # vectors, zero gain). Non-parsed files always get 'block' coverage regardless.
         "scopes": ["symbol"],
-        # languages: NOT read (vestigial + misleading) — which languages get structurally
-        # parsed is decided by language_detector.PARSEABLE (cpp/c_sharp/js/ts already on) +
-        # extension detection, NOT this key. Left for now; honor or delete in a config sweep.
-        "languages": ["python"],
+        # NOTE: language selection is by extension / language_detector.PARSEABLE, NOT a config
+        # key. A former `languages: ["python"]` default was removed — it was never read and
+        # falsely implied non-Python repos wouldn't index.
         # Step 8: merge a C++ header declaration's doc comment (+ decl-site ref) onto the
         # matching out-of-line `.cpp` definition. Off-switch for the per-file sibling-header
         # probe; a no-op for non-C++ and for translation units with no sibling header.
         "cpp_header_merge": True,
     },
     "retrieval": {
-        # mode: NOT read — the per-call task mode is a parameter (CLI --mode / MCP arg);
-        # "hybrid" here describes the strategy, it is not a consumed default.
-        "mode": "hybrid",
+        # The per-call task mode is a parameter (CLI --mode / MCP arg), not a config default;
+        # a former `mode: "hybrid"` key was removed here — it was never read.
         "vector_top_k": 20,
         "keyword_top_k": 20,
         "symbol_top_k": 10,

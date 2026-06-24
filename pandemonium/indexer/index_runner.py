@@ -252,7 +252,7 @@ class Indexer:
         file_summary = self.summarizer.summarize_file(cand.rel_path, language, text, symbols)
 
         idx = self.settings.section("indexing")
-        scopes = idx.get("scopes", ["symbol", "file", "code"])
+        scopes = idx.get("scopes", ["symbol"])  # match the canonical DEFAULTS (symbol-only)
         chunks: List[Chunk] = build_chunks(self.repo_id, fid, cand.rel_path, language,
                                            text, symbols, scopes=scopes,
                                            window_lines=60, overlap=10,
