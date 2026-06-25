@@ -26,6 +26,10 @@ ENV/
 # evals/matrix_baseline.json, which IS tracked); the latest run artifact is not.
 evals/fixtures/matrix/matrix_result.json
 
+# Local external-repo A/B gold (machine-specific abs paths + a private repo's internals;
+# the harness loads it via QA_TASKS — kept out of the tree on purpose).
+evals/qa_tasks_igya.json
+
 # --- OS cruft ---
 .DS_Store
 Thumbs.db

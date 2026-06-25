@@ -121,6 +121,15 @@ TASKS = [
      "gold_symbols": ["runMovementScalar", "runMovement"]},
 ]
 
+# Repo-agnostic override: QA_TASKS=<path to JSON> replaces the built-in PP/RV/SG gold with an
+# external task set (same schema: id, repo, q, gold_files, gold_symbols) so the harness can target
+# ANY indexed repo without editing the hardwired D:\ paths above (the documented "needs real repos"
+# bottleneck). Everything downstream (MCP_CONFIGS, warm-up repo, scoring) reads TASKS, so this one
+# swap retargets the whole run. The built-in list stays the default when QA_TASKS is unset.
+_TASKS_FILE = os.environ.get("QA_TASKS")
+if _TASKS_FILE:
+    TASKS = json.loads(Path(_TASKS_FILE).read_text(encoding="utf-8"))
+
 QUESTION_SUFFIX = (
     "\n\nInvestigate the repository in your working directory, then answer concisely (2-4 "
     "sentences) naming the SINGLE file and the function/method/symbol that is the answer. End "
@@ -249,7 +258,7 @@ def calibrate_warm() -> float:
     used instead of signal.alarm, which is POSIX-only and unavailable on Windows.)"""
     import threading
     try:
-        p = subprocess.Popen([str(PANDE), "serve-mcp", "--repo", PP],
+        p = subprocess.Popen([str(PANDE), "serve-mcp", "--repo", TASKS[0]["repo"]],
                              stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                              stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     except Exception as e:

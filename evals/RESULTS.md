@@ -606,3 +606,49 @@ not a stale-incremental artifact. Graph/edge metrics stay clean (`impact_fp/fn` 
   (delegator / prose / density rerank) can be calibrated and ablated against real evidence.
 - **Honesty caveat:** if `wrong_symbol_same_name_rate` later recovers, part of that is the
   collision set shrinking as scaffolding leaves the index, **not** disambiguation logic improving.
+
+## Agent-level A/B on a real EXTERNAL repo — first run (`qa_ab_runner`, 2026-06-24)
+
+**The gap this closes.** Every A/B above is retrieval-metric or this-repo-only. The M3 gate
+("fewer total task tokens AND lower error vs the no-protocol baseline") had **never** run against
+a real, external repo, because `qa_ab_runner.py` hardwired three `D:\` repos that don't exist on
+this machine. This run targets an **external C# .NET web app (~540 indexed source files, 12.4k
+chunks)** via a new additive override.
+
+**What shipped (harness).** `qa_ab_runner.py` now reads `QA_TASKS=<path-to-gold.json>` to load an
+external task set (same schema: `id, repo, q, gold_files, gold_symbols`), so the harness targets
+ANY indexed repo without editing the hardwired paths — the documented "needs real repos"
+bottleneck, made configurable. Warm-up uses `TASKS[0].repo`. `QA_OUT` (already env-driven) points
+the bench dir off `D:\`. Offline test still PASS; the change is inert when `QA_TASKS` is unset.
+
+**Gold.** 5 anti-circular, grep-derived code-location questions over unique-named C# service
+methods (intent-phrased; the symbol name is NOT in the question). Both arms are read-only;
+Arm A = file tools only, Arm B = + the pandemonium MCP + the real skill prompt.
+
+**Result (n=1 × 5, Sonnet).**
+
+| arm | correct | cost/task | tok/task | turns | MCP fired |
+|---|---|---|---|---|---|
+| vanilla (grep/read) | **5/5** | $0.160 | 109k | 3.8 | — |
+| + protocol | 4/5* | $0.199 (+24%) | 184k (+68%) | 6.2 | **1/5** |
+
+**Honest read — three findings, none flattering, all consistent with the thesis:**
+1. **On pure code-location, vanilla ≥ protocol here** — more expensive, not more accurate. The
+   one `*`miss is **gold ambiguity**, not a protocol error: Arm B named a genuinely valid
+   alternative method (a claim-flow variant of the same operation), arguably more on-target than
+   the grep-derived gold. So effective accuracy is ~even; the real gap is **cost**.
+2. **4/5 Arm-B runs were `[NO-MCP]`** — `serve.py` eager-warms the embedding model (~13s)
+   BEFORE advertising tools (deadlock-safe by design, `mcp/server.py:173`), so a fast agent greps
+   and finishes before the per-run cold server is ready. This is a **harness cold-start artifact**
+   (real usage = a persistent warm server), compounded by C#'s very greppable verbose names
+   (`CloseWarrantyAsync`, `GetOrCreateVehicleWithClassificationAsync`) — the documented "grep wins
+   on a distinctive token" regime. The flag fired honestly (FIX #8), so nothing is hidden.
+3. **This CONFIRMS the project's own thesis**: the protocol's measured win is **impact/graph**, not
+   search-vs-grep ("search+get lost to grep on token count"; ROADMAP guardrails). A code-LOCATION
+   harness structurally tests the dimension where the protocol was never expected to win.
+
+**What this does NOT close (named, not done).** (a) The **impact dimension** — "what calls X / what
+breaks if I change this" — where grep floods and the graph is precise (the real M3 win); needs
+caller-set-graded tasks (extend `ab_runner.py`), not code-location. (b) A **warm-server mode** for
+`qa_ab_runner` so the search dimension is measured faithfully (the stdio + `claude -p` design spawns
+a fresh cold server per run; removing the cold start is non-trivial). (c) n=1 — directional only.
