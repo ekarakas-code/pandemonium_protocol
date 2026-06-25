@@ -80,20 +80,35 @@ CPP_MERGE_GOLD = [
 # is the set of FUNCTIONS/METHODS that contain a call to the target, mapped from a fresh
 # `grep '<name>('` across pandemonium/ + tests/ to its enclosing symbol. Module-level script
 # call sites (e.g. _probe_stem.py) are excluded — callers are symbols, not loose statements.
+#
+# Re-derived AGAIN 2026-06-25 after merging origin (commit 5136bf7). The pull added new modules
+# that call these graph/test helpers, so 5 entries each gained ONE real direct caller (every
+# addition independently grep-verified to its enclosing def, not copied from repo_impact's output):
+#   resolve_call    += skeleton.py::build_skeleton            (skeleton.py:87)
+#   _callers_of     += breakage.py::breakage_check            (breakage.py:98,106)
+#   _edges_available+= breakage.py::breakage_check            (breakage.py:78)
+#   _callees_of     += rerank_signals.py::_impl_callees       (rerank_signals.py:100)
+#   is_test_path    += skeleton.py::build_skeleton            (skeleton.py:69)
+# Before this fix the gate counted those REAL edges as impact false-positives (stale gold, NOT a
+# code regression — confirmed by tracing each to its call site).
 IMPACT_GOLD = [
     {"ref": "pandemonium/graph.py::GraphIndex.resolve_call",
      "true_direct": ["pandemonium/graph.py::_callees_of",
-                     "pandemonium/graph.py::_callers_of"]},
+                     "pandemonium/graph.py::_callers_of",
+                     "pandemonium/skeleton.py::build_skeleton"]},
     {"ref": "pandemonium/graph.py::_callers_of",
-     "true_direct": ["pandemonium/graph.py::repo_graph",
+     "true_direct": ["pandemonium/breakage.py::breakage_check",
+                     "pandemonium/graph.py::repo_graph",
                      "pandemonium/graph.py::repo_impact"]},
     {"ref": "pandemonium/graph.py::_callees_of",
      "true_direct": ["pandemonium/brief.py::_call_flow",
                      "pandemonium/graph.py::repo_graph",
                      "pandemonium/graph.py::repo_logic_map",
+                     "pandemonium/retrieval/rerank_signals.py::_impl_callees",
                      "pandemonium/viz.py::build_graph_data"]},
     {"ref": "pandemonium/graph.py::_edges_available",
-     "true_direct": ["pandemonium/graph.py::repo_graph",
+     "true_direct": ["pandemonium/breakage.py::breakage_check",
+                     "pandemonium/graph.py::repo_graph",
                      "pandemonium/graph.py::repo_impact"]},
     {"ref": "pandemonium/graph.py::_affects_evidence_hash",
      "true_direct": ["pandemonium/graph.py::ingest_affects",
@@ -121,6 +136,7 @@ IMPACT_GOLD = [
                      "pandemonium/graph.py::_split_prod_test",
                      "pandemonium/mapping.py::_build_tests",
                      "pandemonium/brief.py::_partition_tests",
+                     "pandemonium/skeleton.py::build_skeleton",
                      "pandemonium/viz.py::build_graph_data.ensure_dir_chain",
                      "pandemonium/viz.py::build_graph_data.ensure_file",
                      "pandemonium/viz.py::build_graph_data.ensure_symbol",
