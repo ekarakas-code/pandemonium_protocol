@@ -652,3 +652,30 @@ breaks if I change this" — where grep floods and the graph is precise (the rea
 caller-set-graded tasks (extend `ab_runner.py`), not code-location. (b) A **warm-server mode** for
 `qa_ab_runner` so the search dimension is measured faithfully (the stdio + `claude -p` design spawns
 a fresh cold server per run; removing the cold start is non-trivial). (c) n=1 — directional only.
+
+## Impact-dimension A/B harness — BUILT (`qa_impact_ab_runner.py`, 2026-06-25)
+
+**Closes gap (a) above** — the harness that asks the question the protocol was built for: "name every
+method that DIRECTLY calls X." `repo_impact` answers in one call with resolved enclosing callers;
+vanilla must grep the name, open each hit, map it to its enclosing method, and filter false positives.
+Graded OBJECTIVELY by **precision / recall / F1 / exact-set** over a caller SET derived INDEPENDENTLY
+by grep (each call site mapped to its enclosing method, def + interface decl excluded — anti-circular).
+Reuses the `qa_ab_runner` plumbing (offline env, warm calibration, MCP-call counting, `[NO-MCP]` flag);
+loads gold via `QA_IMPACT_TASKS=<json>`. Scoring is unit-validated offline (perfect / partial-recall /
+over-precision / qualified-name normalisation / format-violation / `none`).
+
+**Smoke (1 unique-named target, `SwapCoverageBatteryAsync`, 2 callers).** Both arms **perfect**
+(P=R=F1=1.0, exact); Arm B cost/tokens ≈ Arm A and **still `[NO-MCP]`**. Lesson: a unique-named target
+with few callers is *also* grep-trivial in C# (the interface and impl share the method name, so
+grep-by-name finds every caller cheaply), and the ~13–20 s serve-mcp cold-start still finishes after a
+fast agent does — so the protocol doesn't engage. **The cold-start is the binding constraint for the
+whole `qa_*` family, not the question type.**
+
+**Gold authored for where the protocol SHOULD win (ready, not run — kept cheap per the project's
+discipline).** Two multi-caller targets added: `CanModifyCoverageAsync` (the access-control gate, **7**
+distinct coverage-mutation callers) and `NormalizeToE164_TR` (**10** callers). There `repo_impact`
+returns the whole caller set in one call while grep forces open-and-map across 7–10 sites — the
+cost/recall edge. Running them is gated on first giving the harness a **warm-server mode** (else the
+cold-start mutes Arm B regardless). Net: the impact harness + anti-circular multi-caller gold now
+**exist and are validated**; the one remaining blocker to a fair agent-level verdict — location OR
+impact — is the cold-start, now the explicit next fix.

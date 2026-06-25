@@ -27,8 +27,9 @@ ENV/
 evals/fixtures/matrix/matrix_result.json
 
 # Local external-repo A/B gold (machine-specific abs paths + a private repo's internals;
-# the harness loads it via QA_TASKS — kept out of the tree on purpose).
+# the harnesses load these via QA_TASKS / QA_IMPACT_TASKS — kept out of the tree on purpose).
 evals/qa_tasks_igya.json
+evals/qa_impact_tasks_igya.json
 
 # --- OS cruft ---
 .DS_Store
