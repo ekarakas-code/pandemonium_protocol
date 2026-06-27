@@ -1,0 +1,31 @@
+[
+  {"id": "sg_compute_step",
+   "repo": "D:/SomeStrategyGame",
+   "target": "computeStepFromVelocity",
+   "desc": "the constexpr in src/sim/TeamConfig.hpp that folds a per-axis velocity (with speed/morale/stamina/fitness modifiers) into an integer position step; the scalar and SIMD movement paths share it",
+   "gold_callers": ["stepScalar", "stepSimd4", "runMovementScalar"]},
+
+  {"id": "sg_stamina_factor",
+   "repo": "D:/SomeStrategyGame",
+   "target": "staminaFactorFromStamina",
+   "desc": "the constexpr in src/sim/TeamConfig.hpp that maps a soldier's stamina value to a [floor, 1] speed multiplier",
+   "gold_callers": ["stepScalar", "stepSimd4", "runMovementScalar", "computeForwardDesire"]},
+
+  {"id": "sg_draw_filled_rects",
+   "repo": "D:/SomeStrategyGame",
+   "target": "drawFilledRectsBatched",
+   "desc": "the Renderer method (src/render/Renderer.cpp) that draws many same-colour FILLED rects in one batched SDL_RenderFillRectsF call",
+   "gold_callers": ["submitBatched", "draw", "drawScaledString", "flush"]},
+
+  {"id": "sg_draw_outlined_rects",
+   "repo": "D:/SomeStrategyGame",
+   "target": "drawOutlinedRectsBatched",
+   "desc": "the Renderer method (src/render/Renderer.cpp) that draws many same-colour OUTLINED rects in one batched SDL_RenderDrawRectsF call",
+   "gold_callers": ["draw", "submitBatched", "drawRings"]},
+
+  {"id": "sg_draw_lines",
+   "repo": "D:/SomeStrategyGame",
+   "target": "drawLinesBatched",
+   "desc": "the Renderer method (src/render/Renderer.cpp) that draws a batch of disjoint line segments with one colour set for the whole run",
+   "gold_callers": ["draw", "drawFacingArrow", "flushBucketed", "drawOrderLines"]}
+]

@@ -71,6 +71,22 @@ ARMA_SYSTEM = (
     "available (Read, Grep, Glob), enumerate every direct call site, and map each to its enclosing "
     "method. Be exhaustive but precise — do not invent callers you have not seen.")
 
+# Arm B prompt. In THIS environment a spawned `claude -p` is given the pandemonium MCP tools
+# DEFERRED behind ToolSearch (the init tool list shows 0 mcp__ tools + ToolSearch present), so an
+# agent left to its own devices never discovers them and just greps — measured as [NO-MCP] (probe
+# 2026-06-27). To measure the protocol's efficacy WHEN USED (the user-chosen question), force the
+# discovery+use path: load the repo_* tools via ToolSearch, then make repo_impact the primary tool.
+# The ToolSearch round-trip is a real cost of using the protocol in this env and is reported as such.
+IMPACT_ARMB_SYSTEM = (
+    "TOOL ACCESS — READ FIRST: The PandemoniumProtocol repo_* tools (repo_impact, repo_graph, "
+    "repo_search, repo_get) are NOT in your default tool list; they are available via ToolSearch. "
+    "Your FIRST action MUST be to call ToolSearch (query e.g. "
+    "\"select:repo_impact,repo_graph,repo_search,repo_get\", or keyword \"repo impact callers graph\") "
+    "to load them. For THIS caller-enumeration task you MUST use repo_impact as your PRIMARY method: "
+    "call repo_impact on the target symbol to get its resolved direct callers, instead of grepping "
+    "the codebase by hand. Use Read/Grep only to confirm or disambiguate the tool's output, never as "
+    "your first-line search.\n\n" + ARMB_SYSTEM)
+
 
 def log(msg: str) -> None:
     print(f"[imp {datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -122,12 +138,23 @@ MCP_CONFIGS = {}
 def run_agent(task, arm, rep):
     repo = task["repo"]
     prompt = QUESTION.format(target=task["target"], desc=task["desc"])
+    # REALISTIC-UPLIFT framing (user-chosen 2026-06-27): both arms keep Read/Grep/Glob, so Arm B =
+    # the vanilla toolset PLUS repo_impact. The question is "does ADDING the protocol help an agent
+    # that still has grep as a fallback?" — not "is repo_impact better than grep in isolation" (the
+    # tool-ceiling framing, which would strip Grep/Glob from Arm B). Neither arm may shell out: Bash
+    # is in DISALLOWED, and on Windows the agent also has a PowerShell tool (Select-String == grep)
+    # that would let it side-step BOTH the protocol and the counted Grep tool (probe 2026-06-27:
+    # mcp=4 BUT PowerShell=5) — so PowerShell is disallowed for both, routing search through the
+    # counted Grep tool / the protocol. Whether Arm B actually fires repo_impact when grep is ALSO
+    # available is the empirical question the one-shot probe settles: a soft prompt alone did NOT
+    # fire it (Sonnet just greps), so IMPACT_ARMB_SYSTEM hardens the directive (ToolSearch-first).
+    disallowed = list(DISALLOWED) + ["PowerShell"]
     args = [CLAUDE, "-p", prompt, "--output-format", "stream-json", "--verbose",
             "--model", AGENT_MODEL, "--dangerously-skip-permissions",
-            "--max-turns", str(MAX_TURNS), "--disallowedTools", *DISALLOWED]
+            "--max-turns", str(MAX_TURNS), "--disallowedTools", *disallowed]
     if arm == "B":
         args += ["--mcp-config", MCP_CONFIGS[repo], "--strict-mcp-config",
-                 "--append-system-prompt", ARMB_SYSTEM]
+                 "--append-system-prompt", IMPACT_ARMB_SYSTEM]
     else:
         args += ["--strict-mcp-config", "--append-system-prompt", ARMA_SYSTEM]
     warm = base.WARM_S if arm == "B" else 0.0
