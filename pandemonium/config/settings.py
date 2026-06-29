@@ -29,6 +29,18 @@ DEFAULTS: dict[str, Any] = {
         "lancedb_path": ".pandemonium/lancedb",
         "audit_log": ".pandemonium/audit.log",
     },
+    # Per-call usage analytics -> a `tool_calls` table in the index DB (storage.sqlite_path).
+    # One row per MCP + CLI tool call: session, repo, tool, the question, an answer preview,
+    # request/response token spend (tiktoken — the protocol's context cost), latency, ok/error.
+    # Best-effort: a logging failure NEVER breaks the tool call. Inspect with `pandemonium
+    # stats` / `pandemonium logs`.
+    "usage_logging": {
+        "enabled": True,
+        # How much of each answer to keep: "preview" (first preview_chars), "full", or "none".
+        # Token counts are recorded regardless of this setting.
+        "capture_response": "preview",
+        "preview_chars": 200,
+    },
     "embedding": {
         # provider: NOT read (descriptive only) — the loader is sentence-transformers
         # regardless; only model/device/normalize/batch_size/dim/query_prefix are consumed.

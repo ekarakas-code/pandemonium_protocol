@@ -9,9 +9,10 @@ import typer
 import yaml
 from rich.console import Console
 
-from pandemonium import mapping, service
+from pandemonium import mapping, service, usage
 from pandemonium.config import DEFAULTS, Settings
 from pandemonium.indexer.ignore import DEFAULT_IGNORE
+from pandemonium.util import repo_id_for
 
 # Windows consoles default to cp1252; emit UTF-8 so code excerpts and typography
 # (em dashes, arrows, box-drawing) in `context`/`map`/`search` output render correctly.
@@ -97,7 +98,10 @@ def sync(path: str = typer.Argument(".")) -> None:
 def changed(path: str = _REPO_OPT) -> None:
     """List files that would be (re)indexed, without writing anything."""
     settings = Settings.load(path)
-    ch = service.detect_changes(settings)
+    ch = usage.run(settings, "changed", "", {},
+                   lambda: service.detect_changes(settings),
+                   lambda c: f"new={len(c['new'])} changed={len(c['changed'])} "
+                             f"deleted={len(c['deleted'])} unchanged={len(c['unchanged'])}")
     for label in ("new", "changed", "deleted"):
         items = ch[label]
         console.print(f"[bold]{label}[/] ({len(items)})")
@@ -131,7 +135,10 @@ def search(query: str, repo: str = _REPO_OPT,
                                          "evidence; omit for default)")) -> None:
     """Hybrid search the indexed repository — returns cards (refs + summaries, no code)."""
     settings = Settings.load(repo)
-    results = service.search(settings, query, top_k=top_k, mode=mode or None)
+    results = usage.run(
+        settings, "search", query, {"top_k": top_k, "mode": mode},
+        lambda: service.search(settings, query, top_k=top_k, mode=mode or None),
+        lambda rs: "\n".join(f"{r.ref or r.path} {r.summary or ''}" for r in rs))
     if not results:
         console.print("[yellow]No results. Have you run `pandemonium index .`?[/]")
         raise typer.Exit()
@@ -156,7 +163,10 @@ def get(ref: str,
         repo: str = _REPO_OPT) -> None:
     """Fetch exact code for a stable ref (e.g. `path::Qualified.Name`)."""
     settings = Settings.load(repo)
-    resolved = service.get(settings, ref, expand=expand, view=view)
+    resolved = usage.run(
+        settings, "get", ref, {"expand": expand, "view": view},
+        lambda: service.get(settings, ref, expand=expand, view=view),
+        lambda r: r.code if r else "")
     if resolved is None:
         console.print(f"[yellow]Could not resolve ref:[/] {ref}")
         raise typer.Exit(1)
@@ -173,7 +183,10 @@ def get(ref: str,
 def symbol(name: str, repo: str = _REPO_OPT) -> None:
     """Resolve a symbol by name to its file and line range."""
     settings = Settings.load(repo)
-    matches = service.symbol(settings, name)
+    matches = usage.run(
+        settings, "symbol", name, {},
+        lambda: service.symbol(settings, name),
+        lambda ms: "\n".join(f"{m['name']} {m['path']}:{m['start_line']}" for m in ms))
     if not matches:
         console.print(f"[yellow]No symbol matching '{name}'.[/]")
         raise typer.Exit()
@@ -195,14 +208,18 @@ def context(task: str,
             repo: str = _REPO_OPT) -> None:
     """Build a token-budgeted context pack for a task (markdown to stdout)."""
     settings = Settings.load(repo)
-    typer.echo(service.context_pack(settings, task, token_budget=tokens, mode=mode or None))
+    typer.echo(usage.run(
+        settings, "context", task, {"tokens": tokens, "mode": mode},
+        lambda: service.context_pack(settings, task, token_budget=tokens, mode=mode or None)))
 
 
 @app.command()
 def tests(target: str, repo: str = _REPO_OPT) -> None:
     """Find tests related to a symbol, file, or task."""
     settings = Settings.load(repo)
-    found = service.tests(settings, target)
+    found = usage.run(settings, "tests", target, {},
+                      lambda: service.tests(settings, target),
+                      lambda fs: "\n".join(fs))
     if not found:
         console.print("[yellow]No related tests found.[/]")
         raise typer.Exit()
@@ -218,7 +235,9 @@ def graph(ref: str, repo: str = _REPO_OPT,
     """Related code for a ref: callers, callees, imports, inheritance, members, tests."""
     settings = Settings.load(repo)
     from pandemonium.graph import render_graph
-    g = service.graph_for(settings, ref)
+    g = usage.run(settings, "graph", ref, {"evidence": evidence},
+                  lambda: service.graph_for(settings, ref),
+                  lambda gg: render_graph(gg, show_evidence=evidence) if gg else "")
     if g is None:
         console.print(f"[yellow]Ref not found in the graph:[/] {ref}")
         raise typer.Exit(1)
@@ -230,7 +249,9 @@ def impact(ref: str, repo: str = _REPO_OPT) -> None:
     """What may break if a ref changes: callers, transitive impact, files, tests."""
     settings = Settings.load(repo)
     from pandemonium.graph import render_impact
-    g = service.impact_for(settings, ref)
+    g = usage.run(settings, "impact", ref, {},
+                  lambda: service.impact_for(settings, ref),
+                  lambda gg: render_impact(gg) if gg else "")
     if g is None:
         console.print(f"[yellow]Ref not found in the graph:[/] {ref}")
         raise typer.Exit(1)
@@ -252,7 +273,10 @@ def check(target: str = typer.Argument(""), repo: str = _REPO_OPT) -> None:
     signatures, dangling imports — for edits not yet indexed. Gated: retrieval.breakage_check."""
     settings = Settings.load(repo)
     from pandemonium.breakage import render_breakage
-    typer.echo(render_breakage(service.breakage(settings, target or None)))
+    result = usage.run(settings, "check", target, {},
+                       lambda: service.breakage(settings, target or None),
+                       lambda res: render_breakage(res))
+    typer.echo(render_breakage(result))
 
 
 @app.command()
@@ -260,7 +284,9 @@ def plan(ref: str, repo: str = _REPO_OPT) -> None:
     """Edit plan for a ref: target, callers, tests, deps, risks, and fetch order."""
     settings = Settings.load(repo)
     from pandemonium.graph import render_edit_plan
-    p = service.edit_plan(settings, ref)
+    p = usage.run(settings, "plan", ref, {},
+                  lambda: service.edit_plan(settings, ref),
+                  lambda pp: render_edit_plan(pp) if pp else "")
     if p is None:
         console.print(f"[yellow]Ref not found in the graph:[/] {ref}")
         raise typer.Exit(1)
@@ -272,7 +298,9 @@ def logic_map(topic: str, repo: str = _REPO_OPT) -> None:
     """Conceptual flow for a topic: relevant symbols, domains, files, and call flow."""
     settings = Settings.load(repo)
     from pandemonium.graph import render_logic_map
-    g = service.logic_map(settings, topic)
+    g = usage.run(settings, "logic_map", topic, {},
+                  lambda: service.logic_map(settings, topic),
+                  lambda gg: render_logic_map(gg) if gg else "")
     if g is None:
         console.print("[yellow]No matches for that topic.[/]")
         raise typer.Exit()
@@ -285,7 +313,10 @@ def brief(task: str, repo: str = _REPO_OPT) -> None:
     (graph facts), hard-separated, with an anchor-confidence tier and a next action."""
     settings = Settings.load(repo)
     from pandemonium.brief import render_brief
-    typer.echo(render_brief(service.brief(settings, task)))
+    b = usage.run(settings, "brief", task, {},
+                  lambda: service.brief(settings, task),
+                  lambda bb: render_brief(bb))
+    typer.echo(render_brief(b))
 
 
 @app.command()
@@ -322,7 +353,10 @@ def map(
     settings = Settings.load(repo)
     if mode not in mapping.MODES:
         raise typer.BadParameter(f"mode must be one of {', '.join(mapping.MODES)}")
-    typer.echo(mapping.render_repo_map(service.repo_map(settings, mode=mode)))
+    typer.echo(mapping.render_repo_map(
+        usage.run(settings, "map", mode, {},
+                  lambda: service.repo_map(settings, mode=mode),
+                  lambda mm: mapping.render_repo_map(mm))))
 
 
 @app.command()
@@ -369,6 +403,49 @@ def viz(
     if open_browser:
         import webbrowser
         webbrowser.open(out_path.as_uri())
+
+
+@app.command()
+def stats(repo: str = _REPO_OPT,
+          since: str = typer.Option("", "--since",
+                                    help="Only calls on/after this ISO ts (e.g. 2026-06-01)."),
+          tool: str = typer.Option("", "--tool", help="Filter to one tool (e.g. repo_search)."),
+          session: str = typer.Option("", "--session", help="Filter to one session id."),
+          surface: str = typer.Option("", "--surface", help="mcp | cli."),
+          as_json: bool = typer.Option(False, "--json", help="Emit the aggregate as JSON.")
+          ) -> None:
+    """Aggregated usage stats from the tool_calls log: per-tool call counts, latency
+    (avg/p50/p95) and request/response token spend. Scope with --since/--tool/--surface."""
+    settings = Settings.load(repo)
+    rows = usage.read_calls(settings, repo_id=repo_id_for(settings.repo_root),
+                            tool=tool or None, session=session or None,
+                            surface=surface or None, since=since or None)
+    agg = usage.aggregate(rows)
+    if as_json:
+        import json as _json
+        typer.echo(_json.dumps(agg, ensure_ascii=False, indent=2, default=str))
+    else:
+        typer.echo(usage.render_stats(agg))
+
+
+@app.command()
+def logs(repo: str = _REPO_OPT,
+         limit: int = typer.Option(20, "--limit", "-n", help="How many recent calls to show."),
+         tool: str = typer.Option("", "--tool", help="Filter to one tool."),
+         session: str = typer.Option("", "--session", help="Filter to one session id."),
+         surface: str = typer.Option("", "--surface", help="mcp | cli."),
+         as_json: bool = typer.Option(False, "--json", help="Emit raw rows as JSON.")) -> None:
+    """Recent raw tool calls from the usage log — question, answer preview, token spend,
+    latency, ok/error — most recent first."""
+    settings = Settings.load(repo)
+    rows = usage.read_calls(settings, repo_id=repo_id_for(settings.repo_root),
+                            tool=tool or None, session=session or None,
+                            surface=surface or None, limit=limit)
+    if as_json:
+        import json as _json
+        typer.echo(_json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+    else:
+        typer.echo(usage.render_logs(rows))
 
 
 @app.command("serve-mcp")

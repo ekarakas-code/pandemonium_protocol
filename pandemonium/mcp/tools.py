@@ -23,6 +23,8 @@ from pandemonium.retrieval.hybrid_search import Retriever
 from pandemonium.retrieval.symbol_search import lookup_symbol
 from pandemonium.retrieval.tests_finder import find_tests
 from pandemonium.session import SessionLedger
+from pandemonium.usage import UsageLogger
+from pandemonium.util import repo_id_for
 
 
 def _format_tagline(tags) -> str:
@@ -126,6 +128,8 @@ class ToolContext:
         self.settings = settings
         self.audit = AuditLog(settings.audit_log_path)
         self.session_id = f"mcp-{os.getpid()}"
+        self.repo_id = repo_id_for(settings.repo_root)
+        self.usage = UsageLogger(settings, "mcp", self.session_id, self.repo_id)
         self.ledger = SessionLedger.open(settings, self.session_id)
         self._retriever: Optional[Retriever] = None
         self._graph_index = None  # cached repo-wide GraphIndex; rebuilt only after a reindex
@@ -178,12 +182,15 @@ class ToolContext:
                     ms = (time.perf_counter() - t0) * 1000.0
                     trace(f"tool {_name} OK in {ms:.0f}ms")
                     self.audit.log("mcp_tool_done", tool=_name, ms=round(ms, 1), ok=True)
+                    self.usage.record_call(_name, _raw, args, kwargs, result, ms, ok=True)
                     return result
                 except Exception as e:
                     ms = (time.perf_counter() - t0) * 1000.0
                     trace(f"tool {_name} FAILED in {ms:.0f}ms: {e!r}")
                     self.audit.log("mcp_tool_done", tool=_name, ms=round(ms, 1),
                                    ok=False, error=repr(e))
+                    self.usage.record_call(_name, _raw, args, kwargs, None, ms,
+                                           ok=False, error=repr(e))
                     raise
 
             setattr(self, name, wrapper)
